@@ -76,13 +76,15 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
         return 0;
     };
 
-    // The pointer's halves: `s0` and its copies, `s1 & 0xff` and its copies.
-    let mut lows = vec![low];
+    // The pointer's halves: `s0` (possibly plus a constant byte offset) and its
+    // copies, `s1 & 0xff` (possibly with carry) and its copies.
+    let mut lows: Vec<(Value, u32)> = vec![(low, 0)];
     let mut highs: Vec<Value> = Vec::new();
     let mut raw_highs = vec![high];
     // Instructions that only form the pointer: dropped when nothing reads
     // them any more.
     let mut forming: Vec<(usize, usize)> = Vec::new();
+    let low_offset = |lows: &[(Value, u32)], v: Value| lows.iter().find(|&&(x, _)| x == v).map(|&(_, o)| o);
     loop {
         let mut changed = false;
         for (b, block) in p.blocks.iter().enumerate() {
@@ -93,35 +95,109 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
                 let Some(Operand::Scalar { code: d, .. }) = *dst else {
                     continue;
                 };
-                let Some(out) = inst.write(Reg::S(d)) else {
-                    continue;
-                };
                 let read = |op: &Operand| match *op {
                     Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
                     _ => None,
                 };
-                let found = match (inst.name(), &src[..]) {
+                let const_op = |op: &Operand| match *op {
+                    Operand::Const(c) => crate::resource::inline(c),
+                    Operand::Literal(x) => Some(x),
+                    _ => None,
+                };
+                if inst.name() == "s_mov_b64"
+                    && let [Operand::Scalar { code: s, .. }] = src[..]
+                    && s != NULL
+                {
+                    let mut hit = false;
+                    if let (Some(in_lo), Some(out_lo)) = (inst.read(Reg::S(s)), inst.write(Reg::S(d)))
+                        && let Some(off) = low_offset(&lows, in_lo)
+                        && low_offset(&lows, out_lo).is_none()
+                    {
+                        lows.push((out_lo, off));
+                        hit = true;
+                    }
+                    if let (Some(in_hi), Some(out_hi)) = (inst.read(Reg::S(s + 1)), inst.write(Reg::S(d + 1))) {
+                        if highs.contains(&in_hi) && !highs.contains(&out_hi) {
+                            highs.push(out_hi);
+                            hit = true;
+                        } else if raw_highs.contains(&in_hi) && !raw_highs.contains(&out_hi) {
+                            raw_highs.push(out_hi);
+                            hit = true;
+                        }
+                    }
+                    if hit {
+                        if !forming.contains(&(b, i)) {
+                            forming.push((b, i));
+                        }
+                        changed = true;
+                    }
+                    continue;
+                }
+                let Some(out) = inst.write(Reg::S(d)) else {
+                    continue;
+                };
+                match (inst.name(), &src[..]) {
                     ("s_mov_b32", [s]) => match read(s) {
-                        Some(v) if lows.contains(&v) => Some(&mut lows),
-                        Some(v) if highs.contains(&v) => Some(&mut highs),
-                        Some(v) if raw_highs.contains(&v) => Some(&mut raw_highs),
-                        _ => None,
+                        Some(v) if low_offset(&lows, v).is_some() => {
+                            let off = low_offset(&lows, v).unwrap();
+                            if low_offset(&lows, out).is_none() {
+                                lows.push((out, off));
+                                forming.push((b, i));
+                                changed = true;
+                            }
+                        }
+                        Some(v) if highs.contains(&v) => {
+                            if !highs.contains(&out) {
+                                highs.push(out);
+                                forming.push((b, i));
+                                changed = true;
+                            }
+                        }
+                        Some(v) if raw_highs.contains(&v) => {
+                            if !raw_highs.contains(&out) {
+                                raw_highs.push(out);
+                                forming.push((b, i));
+                                changed = true;
+                            }
+                        }
+                        _ => {}
                     },
                     ("s_and_b32", [x, y]) => {
                         let masked = |a: &Operand, m: &Operand| {
                             matches!(*m, Operand::Literal(0xff))
                                 && read(a).is_some_and(|v| raw_highs.contains(&v))
                         };
-                        (masked(x, y) || masked(y, x)).then_some(&mut highs)
+                        if (masked(x, y) || masked(y, x)) && !highs.contains(&out) {
+                            highs.push(out);
+                            forming.push((b, i));
+                            changed = true;
+                        }
                     }
-                    _ => None,
-                };
-                if let Some(set) = found
-                    && !set.contains(&out)
-                {
-                    set.push(out);
-                    forming.push((b, i));
-                    changed = true;
+                    ("s_add_u32" | "s_add_i32", [x, y]) => {
+                        let added = |a: &Operand, k: &Operand| {
+                            let off = read(a).and_then(|v| low_offset(&lows, v))?;
+                            let add = const_op(k)?;
+                            off.checked_add(add)
+                        };
+                        if let Some(off) = added(x, y).or_else(|| added(y, x))
+                            && low_offset(&lows, out).is_none()
+                        {
+                            lows.push((out, off));
+                            forming.push((b, i));
+                            changed = true;
+                        }
+                    }
+                    ("s_addc_u32", [x, y]) => {
+                        let carried = |a: &Operand, k: &Operand| {
+                            const_op(k) == Some(0) && read(a).is_some_and(|v| highs.contains(&v))
+                        };
+                        if (carried(x, y) || carried(y, x)) && !highs.contains(&out) {
+                            highs.push(out);
+                            forming.push((b, i));
+                            changed = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -169,15 +245,21 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
             else {
                 continue;
             };
+            let Some(base_off) = inst.read(Reg::S(base)).and_then(|v| low_offset(&lows, v)) else {
+                continue;
+            };
             if !inst.name().starts_with("s_load_dword")
                 || !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128))
                 || offset < 0
                 || offset % 4 != 0
-                || !inst.read(Reg::S(base)).is_some_and(|v| lows.contains(&v))
+                || base_off % 4 != 0
                 || !inst.read(Reg::S(base + 1)).is_some_and(|v| highs.contains(&v))
             {
                 continue;
             }
+            let Some(byte_off) = base_off.checked_add(offset as u32) else {
+                continue;
+            };
             let mut dwords = Vec::new();
             for &(reg, v) in &inst.writes {
                 let Reg::S(code) = reg else {
@@ -186,7 +268,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
                 let Some(k) = code.checked_sub(first) else {
                     continue 'insts;
                 };
-                let index = FIRST + offset as u32 / 4 + u32::from(k);
+                let index = FIRST + byte_off / 4 + u32::from(k);
                 let declared = spilled.iter().any(|&(at, n)| index >= at && index < at + n);
                 if !declared {
                     if read_somewhere.contains(&v) {
@@ -376,5 +458,42 @@ mod tests {
         assert_eq!(loads, 1);
         // The pointer is still read, by the load that stays.
         assert!(p.inputs.iter().any(|i| i.0 == Reg::S(0)));
+    }
+
+    #[test]
+    fn shifted_spilled_table_pointer_is_promoted_to_entry_registers() {
+        // s_and_b32 s3, s1, 0xff
+        // s_add_u32 s2, s0, 0x10          (s0 + 16 bytes -> user_data 20)
+        // s_addc_u32 s3, s3, 0
+        // s_load_dword s5, s[2:3], 0x4    (byte 0x14 -> user_data 21)
+        // s_endpgm
+        let words: [u32; 7] = [
+            0x8703_FF01,
+            0x0000_00FF,
+            0x8002_9000, // s_add_u32 s2, s0, 16 (inline const 128+16 = 0x90)
+            0x8203_8003, // s_addc_u32 s3, s3, 0
+            0xF400_0141,
+            0xFA00_0004,
+            0xBF81_0000,
+        ];
+        let n = native(
+            &words,
+            4,
+            vec![
+                param(RootType::Descriptor, 16, 2, 0),
+                param(RootType::Constants, 20, 4, 1),
+            ],
+        );
+        let mut p = ir::build(&n.code, false, 256).unwrap();
+        assert_eq!(user_data(&mut p, &n), 1);
+        let names: Vec<&str> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|i| i.name())
+            .collect();
+        assert_eq!(names, ["s_endpgm"]);
+        let regs: Vec<Reg> = p.inputs.iter().map(|i| i.0).collect();
+        assert_eq!(regs, [Reg::S(21)]);
     }
 }

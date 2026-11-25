@@ -603,6 +603,8 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV alias of the named UAV in dispatch readback order.
+    Uav(usize),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -840,7 +842,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -971,10 +973,14 @@ pub enum View<'a> {
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw buffer UAV initialized from host data.
+    RawUavData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
-    /// An R32_UINT texture UAV (width, height), zeroed (atomics).
+    /// An R32_UINT texture UAV (width, height), zeroed (32-bit atomics).
     UintTextureUav(u32, u32),
+    /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
+    Uint64TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1084,10 +1090,10 @@ impl Host {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
+                                Format: match words {
+                                    1 => DXGI_FORMAT_R32_UINT,
+                                    2 => DXGI_FORMAT_R32G32_UINT,
+                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 },
                                 Width: w,
                                 Height: h,
@@ -1209,7 +1215,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::RawUavData(_) | View::HalfUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1221,6 +1227,12 @@ impl Host {
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
+                            View::RawUavData(data) => (
+                                data.len() as u32,
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len() as u32,
+                                D3D12_BUFFER_UAV_FLAG_RAW,
+                            ),
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
@@ -1229,6 +1241,16 @@ impl Host {
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
                             D3D12_RESOURCE_STATE_COMMON,
                         )?;
+                        if let View::RawUavData(data) = *v {
+                            let init = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &init, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(init);
+                        }
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
                             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -1263,25 +1285,24 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) => {
+                    View::UintTextureUav(w, h) | View::Uint64TextureUav(w, h) => {
+                        let (fmt, words) = match *v {
+                            View::Uint64TextureUav(..) => (DXGI_FORMAT_R32G32_UINT, 2u32),
+                            _ => (DXGI_FORMAT_R32_UINT, 1u32),
+                        };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(
-                                w,
-                                h,
-                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                DXGI_FORMAT_R32_UINT,
-                            ),
+                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, fmt),
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
-                        let pitch = (w * 4).next_multiple_of(256);
+                        let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), 1, rb));
+                        uavs.push((t, Some((w, h)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;
@@ -1364,6 +1385,10 @@ impl Host {
                         let mut at = h.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
                         list.SetComputeRootDescriptorTable(*param, at);
+                    }
+                    Root::Uav(index) => {
+                        let b = &uavs.get(*index).ok_or("root UAV index out of range")?.0;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
                     }
                     Root::View { srv, data } => {
                         let b = upload(data)?;

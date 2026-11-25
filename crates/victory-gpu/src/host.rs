@@ -577,6 +577,48 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // Verify SM 6.6+ dynamic resource heap and 64-bit atomic capabilities at startup.
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        let sm_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .is_ok();
+        let mut o9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        let o9_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                (&raw mut o9).cast(),
+                size_of_val(&o9) as u32,
+            )
+            .is_ok();
+        let mut o11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+        let o11_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS11,
+                (&raw mut o11).cast(),
+                size_of_val(&o11) as u32,
+            )
+            .is_ok();
+        tracing::info!(
+            shader_model = if sm_ok { format!("{:#x}", sm.HighestShaderModel.0) } else { "unknown".into() },
+            atomic_int64_typed = o9_ok && o9.AtomicInt64OnTypedResourceSupported.as_bool(),
+            atomic_int64_groupshared = o9_ok && o9.AtomicInt64OnGroupSharedSupported.as_bool(),
+            atomic_int64_heap = o11_ok && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool(),
+            "host SM 6.6+ descriptor & 64-bit atomic capabilities"
+        );
+        if (sm_ok && sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0)
+            || (o9_ok && !o9.AtomicInt64OnTypedResourceSupported.as_bool())
+            || (o11_ok && !o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool())
+        {
+            tracing::warn!(
+                "host GPU lacks full SM 6.6 64-bit resource/heap atomic support; some translated world shaders may fail PSO creation"
+            );
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -714,6 +756,8 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// The mesh interface, queried once when a direct mesh dispatch needs it.
+    mesh_list: OnceLock<Option<ID3D12GraphicsCommandList6>>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1218,9 +1262,9 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// builds).
 #[cfg(feature = "diagnostics")]
-fn timing() -> bool {
+pub(crate) fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
@@ -2826,6 +2870,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                mesh_list: OnceLock::new(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -3306,8 +3351,20 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                // Neighboring dirty pieces can share one copy command. The
+                // packed offsets and the per-piece CPU merge stay the same.
+                let mut transfers = pieces.iter().peekable();
+                while let Some((shadow, lo, hi, at)) = transfers.next() {
+                    let mut end = *hi;
+                    while let Some((next, start, stop, offset)) = transfers.peek()
+                        && std::sync::Arc::ptr_eq(shadow, next)
+                        && *start == end
+                        && *offset == *at + (end - *lo) as u64
+                    {
+                        end = *stop;
+                        transfers.next();
+                    }
+                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (end - *lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -4047,9 +4104,27 @@ impl Host {
             if timing() {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
-                    crate::copystat::command_took(&op, ms);
+                let timed = runs[i].slowest(frequency, usize::MAX);
+                let mut gpu_ms = 0.0;
+                for (ms, op) in &timed {
+                    gpu_ms += *ms;
+                    crate::copystat::command_took(op, *ms);
                 }
+                let wall_ms = started.elapsed().as_secs_f64() * 1e3;
+                let pipelines: Vec<String> = runs[i]
+                    .pipelines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect();
+                let key = format!("{} cmds, pipelines {:?}", timed.len(), pipelines);
+                let top = timed
+                    .first()
+                    .map(|(ms, op)| format!("{ms:.2} ms {}", crate::copystat::command_key_pub(op)))
+                    .unwrap_or_default();
+                crate::copystat::list_took(gpu_ms, wall_ms, key, top);
             }
             // A submission of one list was never named here (`groups.len()
             // > 1` was the test): the two 50 ms lists of the gameplay
@@ -4328,6 +4403,10 @@ impl Host {
 }
 
 impl HostList {
+    pub(crate) fn mesh_list(&self) -> Option<&ID3D12GraphicsCommandList6> {
+        self.mesh_list.get_or_init(|| self.list.cast().ok()).as_ref()
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -4792,7 +4871,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        if !dred_on() && !timing() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -4805,12 +4884,14 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred_on() {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -5733,6 +5814,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
+        let drop_details = crate::pipeline::take_drop_details();
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
@@ -5817,6 +5899,12 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            for (what, n) in drop_details.iter().take(16) {
+                tracing::info!(
+                    "drop detail {:.1}/frame: {what}",
+                    *n as f64 / frames
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -5866,6 +5954,160 @@ impl Meter {
 }
 
 impl Host {
+    /// Copies a 1024x512 center crop of `texture` (in `state`) into a readback
+    /// buffer and scores how much bright, varied unlit 3D content it holds:
+    /// returns `(score, non_black_pct, unique_color_buckets)`.
+    pub(crate) fn probe_texture_visibility(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+    ) -> Option<(u32, u32, u32)> {
+        // SAFETY: live D3D12 resource.
+        let desc = unsafe { texture.GetDesc() };
+        let fmt = swap_format(desc.Format)?;
+        let (w, h) = (desc.Width as u32, desc.Height);
+        let cw = 1024u32.min(w);
+        let ch = 512u32.min(h);
+        if cw < 16 || ch < 16 {
+            return None;
+        }
+        let bpp: u32 = match fmt {
+            DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
+            _ => 4,
+        };
+        let pitch = (cw * bpp).next_multiple_of(256);
+        let total = u64::from(pitch) * u64::from(ch);
+        let rb = self.read_back_buffer(total)?;
+        let x0 = (w - cw) / 2;
+        let y0 = (h - ch) / 2;
+        let src_box = D3D12_BOX {
+            left: x0,
+            top: y0,
+            front: 0,
+            right: x0 + cw,
+            bottom: y0 + ch,
+            back: 1,
+        };
+        let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer, never released.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer, never released.
+            pResource: unsafe { std::mem::transmute_copy(&rb) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: fmt,
+                        Width: cw,
+                        Height: ch,
+                        Depth: 1,
+                        RowPitch: pitch,
+                    },
+                },
+            },
+        };
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        let need_barrier = state != D3D12_RESOURCE_STATE_COPY_SOURCE;
+        settle_now(WHY_SYNC);
+        let probe_list = self.new_list().ok()?;
+        // SAFETY: open list; all resources stay alive through `self.execute`.
+        unsafe {
+            let l = &probe_list.list;
+            if need_barrier {
+                l.ResourceBarrier(&[transition(
+                    texture,
+                    state,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+            l.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, Some(&src_box));
+            if need_barrier {
+                l.ResourceBarrier(&[transition(
+                    texture,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    state,
+                )]);
+            }
+        }
+        probe_list.close();
+        self.execute(&[&probe_list]);
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: `rb` is a readback buffer whose copy has completed.
+        unsafe { rb.Map(0, None, Some(&mut ptr)) }.ok()?;
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().cast_const(), total as usize) };
+        let mut buckets = [false; 4096];
+        let mut non_black = 0u32;
+        let mut total_px = 0u32;
+        let f16_to_u8 = |bits: u16| -> u8 {
+            if (bits & 0x8000) != 0 {
+                return 0;
+            }
+            let exp = ((bits >> 10) & 0x1f) as i32;
+            let man = (bits & 0x3ff) as u32;
+            if exp == 0 {
+                return 0;
+            }
+            if exp >= 15 {
+                return 255;
+            }
+            let val = ((1024 + man) as f32) * 2f32.powi(exp - 25);
+            (val.clamp(0.0, 1.0) * 255.0) as u8
+        };
+        let step_x = (cw / 128).max(1);
+        let step_y = (ch / 64).max(1);
+        let mut y = 0;
+        while y < ch {
+            let row = &bytes[(y * pitch) as usize..];
+            let mut x = 0;
+            while x < cw {
+                let off = (x * bpp) as usize;
+                let (r, g, b) = match fmt {
+                    DXGI_FORMAT_R16G16B16A16_FLOAT => (
+                        f16_to_u8(u16::from_le_bytes([row[off], row[off + 1]])),
+                        f16_to_u8(u16::from_le_bytes([row[off + 2], row[off + 3]])),
+                        f16_to_u8(u16::from_le_bytes([row[off + 4], row[off + 5]])),
+                    ),
+                    DXGI_FORMAT_R10G10B10A2_UNORM => {
+                        let v = u32::from_le_bytes([row[off], row[off + 1], row[off + 2], row[off + 3]]);
+                        (((v & 0x3ff) >> 2) as u8, (((v >> 10) & 0x3ff) >> 2) as u8, (((v >> 20) & 0x3ff) >> 2) as u8)
+                    }
+                    DXGI_FORMAT_B8G8R8A8_UNORM => (row[off + 2], row[off + 1], row[off]),
+                    _ => (row[off], row[off + 1], row[off + 2]),
+                };
+                if r.max(g).max(b) >= 12 {
+                    non_black += 1;
+                }
+                let key = (((r >> 4) as usize) << 8) | (((g >> 4) as usize) << 4) | ((b >> 4) as usize);
+                buckets[key] = true;
+                total_px += 1;
+                x += step_x;
+            }
+            y += step_y;
+        }
+        // SAFETY: mapped above.
+        unsafe { rb.Unmap(0, None) };
+        let pct = if total_px > 0 { (non_black * 100) / total_px } else { 0 };
+        let unique = buckets.iter().filter(|&&b| b).count() as u32;
+        // Reject flat solid-clear targets (1–2 colors) even if 100% non-black.
+        let mut score = if unique <= 2 {
+            unique
+        } else {
+            pct.saturating_mul(80).saturating_add(unique.saturating_mul(30))
+        };
+        // Prefer R8G8B8A8 Albedo G-buffers over normals/specular when rich in color.
+        if matches!(desc.Format.0, 27..=32) && pct >= 10 && unique >= 20 {
+            score = score.saturating_add(500);
+        }
+        Some((score, pct, unique))
+    }
+
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
@@ -5935,31 +6177,70 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            let material = crate::relight::take_material(texture, &desc);
+            let world_frame = crate::relight::world_frame();
+            let relight = if world_frame && !late_free_present() && !read_now
+                && crate::relight::supports(&desc)
+            {
+                crate::relight::pipeline(&self.device)
+            } else {
+                None
+            };
+            let (read_state, write_state) = if relight.is_some() {
+                (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)
+            } else {
+                (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
+            };
+            let to_back = transition(&back, D3D12_RESOURCE_STATE_PRESENT, write_state);
+            if state != read_state {
+                list.ResourceBarrier(&[transition(texture, state, read_state), to_back]);
+            } else {
+                list.ResourceBarrier(&[to_back]);
+            }
+            if let Some(relight) = relight {
+                let rtv = self.rtv(Some(&back), None);
+                let tracked = material.as_ref().map(|material| {
+                    [&material.color, &material.depth].map(|copy| {
+                        let state = legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+                        (&copy.texture, D3D12_RESOURCE_STATES(state as i32))
+                    })
+                });
+                if let Some(inputs) = tracked {
+                    for (input, state) in inputs {
+                        if state != read_state {
+                            list.ResourceBarrier(&[transition(input, state, read_state)]);
+                        }
+                    }
+                }
+                relight.record(&self.device, list, texture, material.as_ref(), rtv, width, height);
+                if let Some(inputs) = tracked {
+                    for (input, state) in inputs {
+                        if state != read_state {
+                            list.ResourceBarrier(&[transition(input, read_state, state)]);
+                        }
+                    }
+                }
+            } else {
+                list.CopyResource(&back, texture);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_none() && relight.is_none() {
+                crate::capture::probe(&self.device, list, texture)
+            } else {
+                None
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let to_present = transition(&back, write_state, D3D12_RESOURCE_STATE_PRESENT);
+            if state != read_state {
+                list.ResourceBarrier(&[transition(texture, read_state, state), to_present]);
+            } else {
+                list.ResourceBarrier(&[to_present]);
+            }
             copy.close();
             match slot {
                 Some(i) => {

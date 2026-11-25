@@ -162,7 +162,11 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_words(&program(wide, descriptor))
+}
+
+fn build_words(words: &[u32]) -> Result<(HostShader, resource::Resources), ShaderError> {
+    let native = native(words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
@@ -656,6 +660,81 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
     }
+}
+
+#[test]
+fn the_traversal_cache_follows_back_edges_and_cross_page_boxes_on_hardware() {
+    use super::shader::{MEMORY_FAULTS, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+    let mut words = program(true, WHOLE);
+    let at = words.iter().position(|&w| w == 0xF19C_9F07).unwrap();
+    // Repeat the same node test twice, including for active lanes whose
+    // two halves belong to different copies. Compare the counter after each test.
+    words.insert(at, 0xBE9C_0382); // s_mov_b32 s28, 2
+    words.splice(at + 6..at + 6, [
+        0x809C_811C, // s_sub_u32 s28, s28, 1
+        0xBF07_801C, // s_cmp_lg_u32 s28, 0
+        0xBF85_FFF8, // s_cbranch_scc1 back to the image instruction
+    ]);
+    let (shader, res) = build_words(&words).expect("the loop lowers and validates");
+    assert_eq!(res.bvh.len(), 1);
+    assert_eq!(shader.root_srvs, [SLOT_MEMORY]);
+    assert_eq!(shader.root_uavs, [SLOT_FAULTS]);
+    let mut user = vec![0; shader.user_data_dwords() as usize];
+    for dword in &shader.user_data {
+        if dword.root == RootType::Other(USER_MEMORY_BASE) {
+            user[dword.index as usize] = 2;
+        }
+    }
+
+    let bounds = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let wide = nodes::box32([8, 16, 24, 32], [bounds; 4]);
+    let a = 0x1_0040;
+    let cross = 0x1_ffc0;
+    let mut first = vec![0u32; 4 + 65536 / 4];
+    let mut second = vec![0u32; 8 + 65536 / 4];
+    first[4 + 16..4 + 16 + 28].copy_from_slice(&wide);
+    first[4 + 65536 / 4 - 16..].copy_from_slice(&wide[..16]);
+    second[8..8 + 12].copy_from_slice(&wide[16..]);
+    let ray = Ray::new([-2.0, 0.5, 0.5], [1.0, 0.0, 0.0], 8.0);
+    let mut input = vec![0u32; (NODES / 4) as usize];
+    for (lane, addr) in [a, cross].into_iter().enumerate() {
+        let r = &mut input[lane * (RECORD / 4) as usize..][..13];
+        r[0] = (addr >> 3) | 5;
+        r[2] = ray.extent.to_bits();
+        for axis in 0..3 {
+            r[3 + axis] = ray.origin[axis].to_bits();
+            r[6 + axis] = ray.direction[axis].to_bits();
+            r[9 + axis] = ray.inverse[axis].to_bits();
+        }
+        r[12] = 1;
+    }
+    // Page 1 and page 2 map to different UAVs with different byte offsets.
+    let directory = vec![0, 0, 1, 16, 2, 32];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("SM 6.6 hardware adapter");
+    let (root, pso) = host.compute_pipeline(&shader).expect("the traversal PSO");
+    let out = host.dispatch(&root, &pso, &Dispatch {
+        roots: vec![
+            (0, Root::Constants(user)),
+            (1, Root::Uav(4)),
+            (2, Root::View { srv: true, data: directory }),
+        ],
+        views: &[
+            View::Buffer { data: &input, stride: Stride::Raw },
+            View::RawUav(4 * THREADS),
+            View::RawUav(16),
+            View::RawUavData(&first),
+            View::RawUavData(&second),
+            View::RawUav(MEMORY_FAULTS),
+        ],
+        samplers: &[],
+        groups: [1, 1, 1],
+    }).expect("the traversal runs on hardware");
+    let want = bvh::intersect(&wide, 5, &ray, true);
+    for lane in 0..THREADS as usize {
+        assert_eq!(out[0][4 * lane..4 * lane + 4], if lane < 2 { want } else { BEFORE });
+    }
+    assert!(out[4][1..].iter().all(|&fault| fault == 0));
 }
 
 #[test]

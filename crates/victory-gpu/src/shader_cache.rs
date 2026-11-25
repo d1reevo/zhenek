@@ -56,6 +56,8 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
+                bytes.push(u8::from(victory_shader::emit::mesh_output_strict()));
+                bytes.extend_from_slice(victory_shader::emit::f32_denorm_mode().unwrap_or("").as_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

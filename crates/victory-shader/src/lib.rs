@@ -21,7 +21,8 @@ pub mod structure;
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
-    HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
+    EsIo, GsIo, HsIo, HwStage, LsIo, NativeProgram, ResourceType, RootParam, RootType,
+    UsedResource, Xdat, XdatEntry, XdatKind, XdatTable0e, native_programs, parse_xdat,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

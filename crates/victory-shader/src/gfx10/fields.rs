@@ -237,11 +237,12 @@ impl Instruction {
             Encoding::Smem => {
                 let data = match name {
                     "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
-                    n if n.starts_with("s_dcache_discard") => None,
+                    n if n.starts_with("s_dcache_discard") || n.starts_with("s_atc_probe") => None,
                     "s_memtime" | "s_memrealtime" => Some(2),
                     _ => Some(data_dwords(name)),
                 };
-                let base = 2 + 2 * u8::from(name.starts_with("s_buffer_"));
+                let base = 2
+                    + 2 * u8::from(name.starts_with("s_buffer_") || name == "s_atc_probe_buffer");
                 Fields::Smem {
                     data: data.map(|d| scalar((w0 >> 6 & 0x7F) as u8, d)),
                     base: scalar(((w0 & 0x3F) << 1) as u8, base),
@@ -389,7 +390,8 @@ impl Instruction {
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
                 let addr = match self.encoding {
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
-                    Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
+                    Encoding::Global => (!name.ends_with("_addtid"))
+                        .then(|| vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
                     // With an SGPR base, scratch takes no VGPR.
                     _ => (saddr == NULL).then(|| vector(w1 & 0xFF, 1)),
                 };

@@ -64,6 +64,33 @@ impl SigElement {
     }
 }
 
+/// Keep the console's placements except where a row mixes interpolation
+/// modes. The DXIL intrinsics address elements by ID and relative column,
+/// so their operands do not change when the signature is relocated.
+pub(crate) fn separate_interpolation(elements: &mut [SigElement]) -> bool {
+    const ROWS: usize = 32;
+    let mut used: [Option<(u8, u8)>; ROWS] = [None; ROWS];
+    let mut moved = Vec::new();
+    for (id, e) in elements.iter().enumerate() {
+        let Some(row) = e.row else { continue };
+        let Some(slot) = used.get_mut(row as usize) else { return false };
+        match slot {
+            Some((mode, _)) if *mode != e.interp => moved.push(id),
+            Some((_, mask)) => *mask |= e.mask(),
+            None => *slot = Some((e.interp, e.mask())),
+        }
+    }
+    for id in moved {
+        let e = &mut elements[id];
+        let Some((row, slot)) = used.iter_mut().enumerate().find(|(_, slot)| slot.is_none()) else {
+            return false;
+        };
+        e.row = Some(row as u32);
+        *slot = Some((e.interp, e.mask()));
+    }
+    true
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -90,7 +117,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -146,6 +173,8 @@ pub(crate) struct Binding {
 pub(crate) struct Psv<'a> {
     /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
     pub stage: u8,
+    /// PSV runtime info v3, used by validator 1.8.
+    pub entry_name: Option<&'a str>,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
     pub inputs: &'a [SigElement],
@@ -179,7 +208,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
+    u32s(&mut out, &[if p.entry_name.is_some() { 52 } else { 48 }]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
@@ -220,6 +249,10 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
     out.extend(info);
+    if p.entry_name.is_some() {
+        // String table starts with an empty string.
+        u32s(&mut out, &[1]);
+    }
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -232,6 +265,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     }
     // Names of arbitrary semantics (system values use ""), then indices.
     let mut strings = vec![0u8];
+    if let Some(name) = p.entry_name {
+        strings.extend(name.bytes().chain([0]));
+    }
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {

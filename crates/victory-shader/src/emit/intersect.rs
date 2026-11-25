@@ -9,8 +9,9 @@
 //! the card against the reference.
 //!
 //! The title's nodes are in title memory, named by address: they are read
-//! through the host's copies of title memory ([`Lower::memory`]), one look
-//! in its directory per node (two for a 128-byte box node).
+//! through the host's copies of title memory. A lane carries its last BVH
+//! page mapping in SSA, including around traversal back edges. A 128-byte
+//! box uses the same mapping for both halves when they share a page.
 //!
 //! Shape of the code, under the instruction's lane guard:
 //!
@@ -28,6 +29,15 @@
 use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
+use std::collections::HashMap;
+
+/// The last resident page per lane: page index, copy index and page byte offset.
+/// Phis are resolved from the actual DXIL CFG after all lowering splits.
+#[derive(Default)]
+pub(super) struct BvhPages {
+    incoming: HashMap<usize, [V; 3]>,
+    end: HashMap<usize, [V; 3]>,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -133,6 +143,20 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        let zero = self.s.m.i32(0);
+        let gate = self.begin_guarded(guard);
+        let entry = self.cur;
+        let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
+        let kind = self.s.m.bin(entry, Bin::And, pointer, k7);
+        let readable = self.s.m.cmp(entry, pred::IULT, kind, k6);
+        let (node, box_block, triangle_block, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(entry, Term::CondBr(readable, node, join));
+        self.cur = node;
         let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {
@@ -160,10 +184,8 @@ impl<'a> Lower<'a> {
                     *w = self.i32_of(v)?;
                 }
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
-                // One look for the node's copy, before the branches: a
-                // node is 64 bytes on 64, so its first half lies in one
-                // 64 KiB page whatever its kind.
-                let (handle, byte) = self.bvh_memory(low, high, guard);
+                // The first half is 64-byte aligned and fits in one page.
+                let (handle, byte) = self.bvh_memory(low, high);
                 NodeAt::Memory {
                     handle,
                     byte,
@@ -172,22 +194,11 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let zero = self.s.m.i32(0);
-        let gate = self.begin_guarded(guard);
         let head = self.cur;
-        let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
-        let kind = self.s.m.bin(head, Bin::And, pointer, k7);
-        let pair = self.s.m.bin(head, Bin::And, pointer, k6);
-        let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
-        let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
-        let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
-        let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
+        let is_box = self.s.m.cmp(head, pred::IUGE, kind, k4);
         self.s
             .m
-            .terminate(head, Term::CondBr(is_box, box_block, leaf_block));
-        self.s
-            .m
-            .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
+            .terminate(head, Term::CondBr(is_box, box_block, triangle_block));
         self.cur = box_block;
         let boxes = self.bvh_boxes(at, kind, &ray, sort);
         let box_end = self.cur;
@@ -209,7 +220,7 @@ impl<'a> Lower<'a> {
                 vec![
                     (boxes[k], box_end),
                     (triangle[k], triangle_end),
-                    (other[k], leaf_block),
+                    (other[k], entry),
                 ],
             );
             results.push((phi, zero));
@@ -225,7 +236,7 @@ impl<'a> Lower<'a> {
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
     /// is left for the host to fetch, for lanes that run).
-    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V) {
+    fn bvh_memory(&mut self, low: V, high: V) -> (V, V) {
         #[cfg(test)]
         if let Some((slot, base)) = TEST_MEMORY.get() {
             // The buffer at heap slot `slot` holds the bytes from title
@@ -244,18 +255,97 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at);
         }
-        self.memory(low, high, guard)
+        let page = self.memory_page(low, high);
+        let head = self.cur;
+        let [key, copy, start] = self.bvh_page_in(head);
+        let hit = self.s.m.cmp(head, pred::EQ, page, key);
+        let (miss, join) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(head, Term::CondBr(hit, join, miss));
+        self.cur = miss;
+        let fetched = self.memory_lookup(page, None);
+        self.s.m.terminate(miss, Term::Br(join));
+        self.cur = join;
+        let [copy, start] = std::array::from_fn(|i| {
+            let phi = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(phi, vec![([copy, start][i], head), (fetched[i], miss)]);
+            phi
+        });
+        let zero = self.s.m.i32(0);
+        let invalid = self.s.m.i32(u32::MAX);
+        let resident = self.s.m.cmp(join, pred::NE, copy, zero);
+        let key = self.s.m.select(join, resident, page, invalid);
+        self.bvh_pages.end.insert(join, [key, copy, start]);
+        self.memory_view(low, copy, start)
+    }
+
+    fn bvh_page_in(&mut self, block: usize) -> [V; 3] {
+        if block == self.s.entry {
+            let zero = self.s.m.i32(0);
+            return [self.s.m.i32(u32::MAX), zero, zero];
+        }
+        *self.bvh_pages.incoming.entry(block).or_insert_with(|| {
+            std::array::from_fn(|_| self.s.m.phi(block, self.s.t.i32))
+        })
+    }
+
+    /// Thread the page cache along emitted edges, including masked skips,
+    /// box/triangle joins and the original traversal's back edges.
+    pub(super) fn finish_bvh_pages(&mut self) {
+        if self.bvh_pages.incoming.is_empty() {
+            return;
+        }
+        let preds = self.s.m.predecessors();
+        let mut todo: Vec<_> = self
+            .bvh_pages
+            .incoming
+            .keys()
+            .copied()
+            .filter(|&block| !preds[block].is_empty())
+            .collect();
+        todo.sort_unstable();
+        while let Some(block) = todo.pop() {
+            let mut args: [Vec<_>; 3] = std::array::from_fn(|_| Vec::new());
+            for &pred in &preds[block] {
+                let values = if let Some(&values) = self.bvh_pages.end.get(&pred) {
+                    values
+                } else {
+                    if pred != self.s.entry && !self.bvh_pages.incoming.contains_key(&pred) {
+                        todo.push(pred);
+                    }
+                    self.bvh_page_in(pred)
+                };
+                for (incoming, value) in args.iter_mut().zip(values) {
+                    incoming.push((value, pred));
+                }
+            }
+            for (phi, incoming) in self.bvh_pages.incoming[&block].into_iter().zip(args) {
+                self.s.m.set_phi(phi, incoming);
+            }
+        }
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
-    fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
+    fn bvh_node_words(
+        &mut self,
+        at: NodeAt,
+        base: Option<V>,
+        offset: u32,
+        count: u32,
+        float: bool,
+    ) -> Vec<V> {
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         // The second half of a 128-byte node may lie in the next 64 KiB
         // page, which may be in another copy: its own look, made once.
         let mut second = None;
+        let (op, ret) = if float {
+            ("rawBufferLoad.f32", self.s.t.res_ret)
+        } else {
+            let i32t = self.s.t.i32;
+            let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+            ("rawBufferLoad.i32", ret)
+        };
         let mut out = Vec::with_capacity(count as usize);
         for start in (0..count).step_by(4) {
             let n = (count - start).min(4);
@@ -265,12 +355,12 @@ impl<'a> Lower<'a> {
                 NodeAt::Memory { handle, byte, .. } if node_byte < 64 => (handle, byte),
                 NodeAt::Memory { low, high, .. } => *second.get_or_insert_with(|| {
                     let (low, high) = self.address_plus(low, high, 64);
-                    // Every lane in this block runs the instruction.
-                    let (handle, byte) = self.bvh_memory(low, high, None);
+                    let (handle, byte) = self.bvh_memory(low, high);
                     let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
+                    (handle, self.s.m.bin(self.cur, Bin::Sub, byte, k64))
                 }),
             };
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -279,15 +369,14 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
-                "rawBufferLoad.f32",
+                op,
                 Attr::ReadOnly,
-                self.s.t.res_ret,
+                ret,
                 139,
                 &[handle, byte, undef, mask, align],
             );
             for k in 0..n {
-                let f = self.s.m.extract(c, r, k);
-                out.push(self.as_int(f));
+                out.push(self.s.m.extract(c, r, k));
             }
         }
         out
@@ -305,9 +394,9 @@ impl<'a> Lower<'a> {
         let k8 = self.s.m.int_const(i64t, 8);
         let base = self.s.m.bin(c, Bin::Shl, base, k8);
         let p = self.join64(pointer, pointer_high.unwrap_or(zero));
-        let (k3, k6) = (self.s.m.int_const(i64t, 3), self.s.m.int_const(i64t, 6));
-        let p = self.s.m.bin(c, Bin::LShr, p, k3);
-        let p = self.s.m.bin(c, Bin::Shl, p, k6);
+        let (k3, mask) = (self.s.m.int_const(i64t, 3), self.s.m.int_const(i64t, -8));
+        let p = self.s.m.bin(c, Bin::And, p, mask);
+        let p = self.s.m.bin(c, Bin::Shl, p, k3);
         let a = self.s.m.bin(c, Bin::Add, base, p);
         self.s.flags |= flags::INT64;
         self.split64(a)
@@ -317,7 +406,7 @@ impl<'a> Lower<'a> {
     /// current block and leaves `self.cur` at the block it ends in.
     fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
         let head = self.cur;
-        let children = self.bvh_node_words(at, None, 0, 4);
+        let children = self.bvh_node_words(at, None, 0, 4, false);
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -328,13 +417,13 @@ impl<'a> Lower<'a> {
         // 32-bit floats: 24 dwords from byte 16.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let words = self.bvh_node_words(at, None, 16, 24);
-        let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        let floats = self.bvh_node_words(at, None, 16, 24, true);
+        let wide_end = self.cur;
+        self.s.m.terminate(wide_end, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
-        let words = self.bvh_node_words(at, None, 16, 12);
+        let words = self.bvh_node_words(at, None, 16, 12, false);
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
@@ -359,7 +448,7 @@ impl<'a> Lower<'a> {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_block)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).
@@ -427,7 +516,7 @@ impl<'a> Lower<'a> {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         // The triangle's byte of the dword at byte 60: which of its
         // vertices barycentric I and J weigh.
-        let id = self.bvh_node_words(at, None, 60, 1)[0];
+        let id = self.bvh_node_words(at, None, 60, 1, false)[0];
         let (k2, k3, k12, k15) = (k(self, 2), k(self, 3), k(self, 12), k(self, 15));
         let shift = self.s.m.bin(c, Bin::Shl, kind, k3);
         let id = self.s.m.bin(c, Bin::LShr, id, shift);
@@ -454,15 +543,9 @@ impl<'a> Lower<'a> {
             let vertex = self.s.m.bin(c, Bin::LShr, map, nibble);
             let vertex = self.s.m.bin(c, Bin::And, vertex, k15);
             let byte = self.s.m.bin(c, Bin::Mul, vertex, k12);
-            let words = self.bvh_node_words(at, Some(byte), 0, 3);
+            let words = self.bvh_node_words(at, Some(byte), 0, 3, true);
             // Relative to the ray's origin.
-            let r: Vec<V> = (0..3)
-                .map(|a| {
-                    let f = self.as_float(words[a]);
-                    self.s.m.bin(c, Bin::Sub, f, ray.origin[a])
-                })
-                .collect();
-            p.push([r[0], r[1], r[2]]);
+            p.push(std::array::from_fn(|a| self.s.m.bin(c, Bin::Sub, words[a], ray.origin[a])));
         }
         // The ray's largest axis z, and x and y after it in an order that
         // keeps the winding.
@@ -475,30 +558,32 @@ impl<'a> Lower<'a> {
         let on = self.s.m.bool(true);
         let not_xy = self.s.m.bin(c, Bin::Xor, xy, on);
         let z1 = self.s.m.bin(c, Bin::And, not_xy, yz);
-        // Component (kz + n) % 3 of `q`.
-        let pick = |l: &mut Self, q: [V; 3], n: usize| {
-            let rest = l.s.m.select(c, z1, q[(1 + n) % 3], q[(2 + n) % 3]);
-            l.s.m.select(c, z0, q[n % 3], rest)
+        let z2 = self.s.m.bin(c, Bin::Or, z0, z1);
+        let z2 = self.s.m.bin(c, Bin::Xor, z2, on);
+        let pick = |l: &mut Self, q: [V; 3], a: V, b: V| {
+            let rest = l.s.m.select(c, b, q[1], q[2]);
+            l.s.m.select(c, a, q[0], rest)
         };
-        let dz = pick(self, ray.direction, 0);
+        let dz = pick(self, ray.direction, z0, z1);
         let backwards = self.s.m.cmp(c, pred::OLT, dz, fzero);
-        // (x, y, z) of `q`: the two after the largest axis, swapped for a
-        // ray that runs backwards along it.
-        let axes = |l: &mut Self, q: [V; 3]| {
-            let (x, y) = (pick(l, q, 1), pick(l, q, 2));
-            [
-                l.s.m.select(c, backwards, y, x),
-                l.s.m.select(c, backwards, x, y),
-                pick(l, q, 0),
-            ]
-        };
-        let d = axes(self, ray.direction);
-        let sz = pick(self, ray.inverse, 0);
-        let sx = self.s.m.bin(c, Bin::Mul, d[0], sz);
-        let sy = self.s.m.bin(c, Bin::Mul, d[1], sz);
+        // Choose the swizzle once per ray, not twice for every vertex.
+        // Tie-breaking and the order of the float operations stay the same.
+        let x0 = self.s.m.select(c, backwards, z1, z2);
+        let x1 = self.s.m.select(c, backwards, z2, z0);
+        let y0 = self.s.m.select(c, backwards, z2, z1);
+        let y1 = self.s.m.select(c, backwards, z0, z2);
+        let dx = pick(self, ray.direction, x0, x1);
+        let dy = pick(self, ray.direction, y0, y1);
+        let sz = pick(self, ray.inverse, z0, z1);
+        let sx = self.s.m.bin(c, Bin::Mul, dx, sz);
+        let sy = self.s.m.bin(c, Bin::Mul, dy, sz);
         let mut sheared = Vec::with_capacity(3);
         for r in p {
-            let r = axes(self, r);
+            let r = [
+                pick(self, r, x0, x1),
+                pick(self, r, y0, y1),
+                pick(self, r, z0, z1),
+            ];
             let x = self.s.m.bin(c, Bin::Mul, sx, r[2]);
             let x = self.s.m.bin(c, Bin::Sub, r[0], x);
             let y = self.s.m.bin(c, Bin::Mul, sy, r[2]);

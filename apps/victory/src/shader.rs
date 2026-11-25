@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use victory_game::sgd5;
 use victory_shader::gfx10::{self, Instruction};
-use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, native_programs};
+use victory_shader::native::StageIo;
+use victory_shader::{
+    Container, DxilProgram, FourCC, HwStage, ShaderError, XdatKind, native_programs, parse_xdat,
+};
 
 /// Files above this size are skipped (read whole into memory for now).
 pub(crate) const MAX_FILE: u64 = 2 << 30;
@@ -60,6 +63,7 @@ struct Totals {
     standard_layout: usize,
     xdat: usize,
     xbop: usize,
+    xdat_kinds: BTreeMap<String, usize>,
     kinds: BTreeMap<String, usize>,
     with_native: usize,
     native_stages: BTreeMap<HwStage, usize>,
@@ -106,13 +110,60 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
                 // Independent of the bitcode: titles may strip it.
+                if let Some(Ok(Some(xdat))) = dxil.map(|p| parse_xdat(p.data)) {
+                    for e in &xdat.entries {
+                        let key = match e.kind {
+                            XdatKind::Bitcode => "0x07 (bitcode)".to_owned(),
+                            XdatKind::Options => "0x0a (xbop)".to_owned(),
+                            XdatKind::NativeUnpacked => "0x0c (raw FSSM)".to_owned(),
+                            XdatKind::Native => "0x0d (XBCH->FSSM)".to_owned(),
+                            XdatKind::Table0e => "0x0e (table)".to_owned(),
+                            XdatKind::Hash10 => "0x10 (hash)".to_owned(),
+                            XdatKind::Hash12 => "0x12 (hash)".to_owned(),
+                            XdatKind::Other(k) => format!("{k:#04x}"),
+                        };
+                        *t.xdat_kinds.entry(key).or_default() += 1;
+                    }
+                }
                 let native = match dxil.map(|p| native_programs(p.data)) {
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;
                         let mut list = Vec::new();
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
-                            list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            let io_note = match &n.io {
+                                StageIo::Es(es) => format!(
+                                    " (in={} out={} item={}dw lds={}B)",
+                                    es.inputs.len(),
+                                    es.outputs.len(),
+                                    es.esgs_itemsize_dwords,
+                                    es.lds_bytes
+                                ),
+                                StageIo::Gs(gs) => format!(
+                                    " (out={} maxv={} vdw={} ring={}dw topo={} inv={} copy={}B lds={}B)",
+                                    gs.outputs.len(),
+                                    gs.max_vertices,
+                                    gs.vertex_size_dwords,
+                                    gs.ring_itemsize_dwords,
+                                    gs.output_topology,
+                                    gs.input_vertices,
+                                    gs.copy_code.len(),
+                                    gs.lds_bytes
+                                ),
+                                StageIo::Ls(ls) => format!(
+                                    " (in={} out={} item={}dw lds={}B)",
+                                    ls.inputs.len(),
+                                    ls.outputs.len(),
+                                    ls.lshs_itemsize_dwords,
+                                    ls.lds_bytes
+                                ),
+                                StageIo::Hs(hs) => format!(
+                                    " (sd={}B lds={}B)",
+                                    hs.stage_data_len, hs.lds_bytes
+                                ),
+                                _ => String::new(),
+                            };
+                            list.push(format!("{:?} {} B{io_note}", n.stage, n.code.len()));
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -187,6 +238,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     println!("  PC-standard layout   {}", t.standard_layout);
     println!("  XDAT prefix          {}", t.xdat);
     println!("  xbop trailer         {}", t.xbop);
+    for (k, n) in &t.xdat_kinds {
+        println!("    xdat {k:<18} {n}");
+    }
     for (k, n) in &t.kinds {
         println!("  {k:<20} {n}");
     }

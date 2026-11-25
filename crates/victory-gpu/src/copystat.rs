@@ -176,6 +176,29 @@ static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(No
 /// their microseconds, and the longest one's.
 static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
 
+/// With `VICTORY_GPU_TIMING`: per command list signature: (count, gpu_us, wall_us, max_gpu_us, top_cmd).
+static LISTS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64, u64, String)>>> = Mutex::new(None);
+
+/// A command list took `gpu_ms` (sum of command timestamps) / `wall_ms` (fence wait).
+pub(crate) fn list_took(gpu_ms: f64, wall_ms: f64, key: String, top_cmd: String) {
+    let gpu_us = (gpu_ms * 1e3) as u64;
+    let wall_us = (wall_ms * 1e3) as u64;
+    let mut by = LISTS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    let e = by.get_or_insert_with(HashMap::new).entry(key).or_insert((0, 0, 0, 0, String::new()));
+    e.0 += 1;
+    e.1 += gpu_us;
+    e.2 += wall_us;
+    if gpu_us >= e.3 {
+        e.3 = gpu_us;
+        e.4 = top_cmd;
+    }
+}
+
+/// Public wrapper for [`command_key`].
+pub(crate) fn command_key_pub(op: &str) -> String {
+    command_key(op)
+}
+
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
@@ -1195,6 +1218,20 @@ pub(crate) fn log(frames: f64) {
             "  the card's time by what ran: {:.1} ms a frame in {:.1} submissions a frame: {}",
             us as f64 / 1e3 / frames,
             n as f64 / frames,
+            what.chars().take(700).collect::<String>()
+        );
+    }
+    let lists_by = LISTS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut lists_by: Vec<_> = lists_by.into_iter().flatten().collect();
+    lists_by.sort_by_key(|&(_, (_, gpu_us, _, _, _))| std::cmp::Reverse(gpu_us));
+    for (what, (n, gpu_us, wall_us, max_gpu_us, top)) in lists_by.into_iter().take(20) {
+        tracing::info!(
+            "  the card's time by command list (timing run): {:.2} ms GPU ({:.2} ms wall) a frame in {:.1} lists/frame, max {:.2} ms, top [{}]: {}",
+            gpu_us as f64 / 1e3 / frames,
+            wall_us as f64 / 1e3 / frames,
+            n as f64 / frames,
+            max_gpu_us as f64 / 1e3,
+            top,
             what.chars().take(700).collect::<String>()
         );
     }

@@ -41,6 +41,170 @@ pub(crate) use host;
 /// separator, no NUL).
 static DRIVES: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
 
+/// Optional read-only fallback directory for `G:\` reads (`VICTORY_READONLY_FALLBACK_DIR`).
+/// Never used for write/delete/create/rename operations.
+fn readonly_fallback_root() -> Option<&'static [u16]> {
+    static ROOT: std::sync::OnceLock<Option<Vec<u16>>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = std::env::var_os("VICTORY_READONLY_FALLBACK_DIR")?;
+        if dir.is_empty() {
+            return None;
+        }
+        Some(root_wide(Path::new(&dir)))
+    })
+    .as_deref()
+}
+
+const OPEN_EXISTING: u32 = 3;
+const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
+const INVALID_HANDLE_VAL: Handle = -1isize as Handle;
+const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+const SH_DENYNO: i32 = 0x40;
+/// Any Win32 access bit that can write, append, delete, or change metadata/ACLs.
+const WRITE_OR_MODIFY_ACCESS: u32 = 0x4000_0000 // GENERIC_WRITE
+    | 0x1000_0000 // GENERIC_ALL
+    | 0x0001_0000 // DELETE
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+    | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+    | 0x0000_0010 // FILE_WRITE_EA
+    | 0x0000_0100; // FILE_WRITE_ATTRIBUTES
+
+fn is_strictly_readonly_win32(access: u32, disposition: u32) -> bool {
+    disposition == OPEN_EXISTING && (access & WRITE_OR_MODIFY_ACCESS) == 0
+}
+
+fn is_strictly_readonly_crt_wide(mode: *const u16) -> bool {
+    if mode.is_null() {
+        return false;
+    }
+    // SAFETY: the title passes a NUL-terminated mode string.
+    let slice = unsafe {
+        let len = (0..).take_while(|&i| *mode.add(i) != 0).count();
+        std::slice::from_raw_parts(mode, len)
+    };
+    let mut has_r = false;
+    for &c in slice {
+        if c == u16::from(b'r') || c == u16::from(b'R') {
+            has_r = true;
+        } else if matches!(
+            c,
+            x if x == u16::from(b'w')
+                || x == u16::from(b'W')
+                || x == u16::from(b'a')
+                || x == u16::from(b'A')
+                || x == u16::from(b'+')
+        ) {
+            return false;
+        }
+    }
+    has_r
+}
+
+fn is_strictly_readonly_crt_narrow(mode: *const c_char) -> bool {
+    if mode.is_null() {
+        return false;
+    }
+    // SAFETY: the title passes a NUL-terminated mode string.
+    let bytes = unsafe { CStr::from_ptr(mode) }.to_bytes();
+    let mut has_r = false;
+    for &b in bytes {
+        match b {
+            b'r' | b'R' => has_r = true,
+            b'w' | b'W' | b'a' | b'A' | b'+' => return false,
+            _ => {}
+        }
+    }
+    has_r
+}
+
+fn is_strictly_readonly_open_flags(flags: i32) -> bool {
+    // _O_WRONLY (1) | _O_RDWR (2) | _O_APPEND (8) | _O_CREAT (0x100) | _O_TRUNC (0x200)
+    (flags & 0x030B) == 0
+}
+
+/// Rewrites a `G:\...` title path to `VICTORY_READONLY_FALLBACK_DIR\...` for
+/// strictly read-only operations. Rejects `..` path traversal.
+fn translate_readonly_fallback(path: &[u16]) -> Option<Vec<u16>> {
+    let root = readonly_fallback_root()?;
+    let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
+        Some(rest) => (&VERBATIM[..], rest),
+        None => (&[][..], path),
+    };
+    let &[letter, colon, ..] = rest else {
+        return None;
+    };
+    if colon != u16::from(b':') {
+        return None;
+    }
+    let letter = u8::try_from(letter).ok()?;
+    if !matches!(letter, b'G' | b'g') {
+        return None;
+    }
+    let tail = &rest[2..];
+    let dot = u16::from(b'.');
+    if tail
+        .split(|c| SEPARATORS.contains(c))
+        .any(|part| part == [dot, dot])
+    {
+        return None;
+    }
+    if prefix.is_empty() && root.len() + tail.len() >= LONG {
+        let mut out = verbatim(root, tail);
+        out.push(0);
+        return Some(out);
+    }
+    let mut out = prefix.to_vec();
+    out.extend_from_slice(root);
+    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
+        out.push(b'\\'.into());
+    }
+    let is_verbatim = !prefix.is_empty();
+    out.extend(tail.iter().map(|&c| {
+        if is_verbatim && c == u16::from(b'/') {
+            b'\\'.into()
+        } else {
+            c
+        }
+    }));
+    out.push(0);
+    Some(out)
+}
+
+fn wide_readonly_fallback(path: *const u16) -> Option<Vec<u16>> {
+    if path.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes a NUL-terminated path.
+    let path_slice = unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        std::slice::from_raw_parts(path, len)
+    };
+    translate_readonly_fallback(path_slice)
+}
+
+fn narrow_readonly_fallback(path: *const c_char) -> Option<Vec<u16>> {
+    if path.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes a NUL-terminated path.
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
+        [b'G' | b'g', b':', ..] => {}
+        _ => return None,
+    }
+    let len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: sizing call, then a call with room for `n` units.
+    let wide = unsafe {
+        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+        let mut wide = vec![0u16; usize::try_from(n).ok()?];
+        MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
+        wide
+    };
+    translate_readonly_fallback(&wide)
+}
+
 fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
     DRIVES.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -262,6 +426,22 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    if is_strictly_readonly_win32(access, disposition)
+        && let Some(fb) = wide_readonly_fallback(path)
+    {
+        let h = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            fb.as_ptr(),
+            access,
+            share | FILE_SHARE_ALL,
+            security,
+            OPEN_EXISTING,
+            flags,
+            template,
+        );
+        if h != INVALID_HANDLE_VAL {
+            return h;
+        }
+    }
     let p = wide(path);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
@@ -283,6 +463,22 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    if is_strictly_readonly_win32(access, disposition)
+        && let Some(fb) = narrow_readonly_fallback(path)
+    {
+        let h = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            fb.as_ptr(),
+            access,
+            share | FILE_SHARE_ALL,
+            security,
+            OPEN_EXISTING,
+            flags,
+            template,
+        );
+        if h != INVALID_HANDLE_VAL {
+            return h;
+        }
+    }
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
@@ -317,6 +513,20 @@ pub extern "system" fn CreateFile2(
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
+    if is_strictly_readonly_win32(access, disposition)
+        && let Some(fb) = wide_readonly_fallback(path)
+    {
+        let h = host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
+            fb.as_ptr(),
+            access,
+            share | FILE_SHARE_ALL,
+            OPEN_EXISTING,
+            params,
+        );
+        if h != INVALID_HANDLE_VAL {
+            return h;
+        }
+    }
     let p = wide(path);
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
@@ -357,6 +567,14 @@ pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> 
 }
 
 pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
+    if let Some(fb) = narrow_readonly_fallback(path) {
+        let attrs = host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
+            fb.as_ptr(),
+        );
+        if attrs != INVALID_FILE_ATTRIBUTES {
+            return attrs;
+        }
+    }
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
@@ -384,6 +602,16 @@ pub extern "system" fn GetFileAttributesExW(
     level: i32,
     info: *mut c_void,
 ) -> i32 {
+    if let Some(fb) = wide_readonly_fallback(path) {
+        let ok = host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
+            fb.as_ptr(),
+            level,
+            info,
+        );
+        if ok != 0 {
+            return ok;
+        }
+    }
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
         p.ptr(),
@@ -393,6 +621,14 @@ pub extern "system" fn GetFileAttributesExW(
 }
 
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
+    if let Some(fb) = wide_readonly_fallback(path) {
+        let attrs = host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
+            fb.as_ptr(),
+        );
+        if attrs != INVALID_FILE_ATTRIBUTES {
+            return attrs;
+        }
+    }
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
 }
@@ -492,11 +728,38 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 // The C runtime (ucrtbase, which the title's CRT imports bind to).
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
+    if is_strictly_readonly_crt_wide(mode)
+        && let Some(fb) = wide_readonly_fallback(path)
+    {
+        let f = host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+            fb.as_ptr(),
+            mode,
+            SH_DENYNO,
+        );
+        if !f.is_null() {
+            return f;
+        }
+    }
     let p = wide(path);
     host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
 }
 
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
+    if !out.is_null()
+        && is_strictly_readonly_crt_wide(mode)
+        && let Some(fb) = wide_readonly_fallback(path)
+    {
+        let f = host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+            fb.as_ptr(),
+            mode,
+            SH_DENYNO,
+        );
+        if !f.is_null() {
+            // SAFETY: caller passed a valid out pointer, verified non-null above.
+            unsafe { *out = f };
+            return 0;
+        }
+    }
     let p = wide(path);
     host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
         out,
@@ -506,6 +769,18 @@ pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) 
 }
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
+    if is_strictly_readonly_crt_wide(mode)
+        && let Some(fb) = wide_readonly_fallback(path)
+    {
+        let f = host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+            fb.as_ptr(),
+            mode,
+            SH_DENYNO,
+        );
+        if !f.is_null() {
+            return f;
+        }
+    }
     let p = wide(path);
     host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
         p.ptr(),
@@ -543,6 +818,18 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
+    if is_strictly_readonly_crt_narrow(mode)
+        && let Some(fb) = narrow_readonly_fallback(path)
+    {
+        let f = host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+            fb.as_ptr(),
+            widen(mode).as_ptr(),
+            SH_DENYNO,
+        );
+        if !f.is_null() {
+            return f;
+        }
+    }
     match narrow(path) {
         Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
             p.as_ptr(),
@@ -557,6 +844,21 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 }
 
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
+    if !out.is_null()
+        && is_strictly_readonly_crt_narrow(mode)
+        && let Some(fb) = narrow_readonly_fallback(path)
+    {
+        let f = host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+            fb.as_ptr(),
+            widen(mode).as_ptr(),
+            SH_DENYNO,
+        );
+        if !f.is_null() {
+            // SAFETY: caller passed a valid out pointer, verified non-null above.
+            unsafe { *out = f };
+            return 0;
+        }
+    }
     match narrow(path) {
         Some(p) => {
             host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
@@ -576,6 +878,18 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 /// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
 /// travels in the same register either way, so it is passed on as is.
 pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
+    if is_strictly_readonly_open_flags(flags)
+        && let Some(fb) = narrow_readonly_fallback(path)
+    {
+        let fd = host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+            fb.as_ptr(),
+            flags,
+            mode,
+        );
+        if fd >= 0 {
+            return fd;
+        }
+    }
     match narrow(path) {
         Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
             p.as_ptr(),
@@ -590,6 +904,18 @@ pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
 
 /// See [`_open`]; used by libHttpClient.
 pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
+    if is_strictly_readonly_open_flags(flags)
+        && let Some(fb) = wide_readonly_fallback(path)
+    {
+        let fd = host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+            fb.as_ptr(),
+            flags,
+            mode,
+        );
+        if fd >= 0 {
+            return fd;
+        }
+    }
     let p = wide(path);
     host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
         p.ptr(),
@@ -599,11 +925,29 @@ pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
 }
 
 pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
+    if let Some(fb) = wide_readonly_fallback(path) {
+        let rc = host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32)(
+            fb.as_ptr(),
+            stat,
+        );
+        if rc == 0 {
+            return 0;
+        }
+    }
     let p = wide(path);
     host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32)(p.ptr(), stat)
 }
 
 pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
+    if let Some(fb) = narrow_readonly_fallback(path) {
+        let rc = host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)(
+            fb.as_ptr(),
+            stat,
+        );
+        if rc == 0 {
+            return 0;
+        }
+    }
     match narrow(path) {
         Some(p) => {
             host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)(

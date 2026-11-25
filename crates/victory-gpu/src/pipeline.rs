@@ -129,6 +129,21 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// Saves the raw console container once under `<cache>/failed-shaders` so
+    /// failing graphics shaders can be disassembled offline.
+    pub(crate) fn save_failed_container(&self) {
+        let Some(dir) = library::failed_shader_dir() else {
+            return;
+        };
+        let path = dir.join(format!("{}.{}.cdxil", self.hash, self.stage));
+        if path.exists() {
+            return;
+        }
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(&path, &self.container);
+        }
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -158,12 +173,17 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        if self.stage != "compute" {
+                            self.save_failed_container();
+                        }
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                    }
                 }
                 done.ok()
             })
@@ -397,6 +417,47 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Lightweight per-pipeline drop breakdown for release runs (called only on
+/// already-dropped ops and drained every 5 s by the frame meter).
+#[cfg(windows)]
+static DROP_DETAILS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+#[cfg(windows)]
+pub(crate) fn record_drop_detail(kind: &'static str, this: This, targets: &str) {
+    let why = if this.is_null() {
+        "null pipeline".to_owned()
+    } else {
+        let p = pipeline(this);
+        if p.builder && !builder_runs() {
+            "bvh-builder".to_owned()
+        } else {
+            make::missing(&p.host).unwrap_or_else(|| format!("other {:?}", p.shaders))
+        }
+    };
+    let key = if targets.is_empty() {
+        format!("{kind} | {why}")
+    } else {
+        format!("{kind} | {why} | {targets}")
+    };
+    let mut map = DROP_DETAILS.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = map.get_or_insert_with(HashMap::new);
+    if let Some(count) = entries.get_mut(&key) {
+        *count += 1;
+    } else if entries.len() < 128 {
+        entries.insert(key, 1);
+    } else {
+        *entries.entry(format!("{kind} | (other)")).or_default() += 1;
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn take_drop_details() -> Vec<(String, u64)> {
+    let entries = DROP_DETAILS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut rows: Vec<(String, u64)> = entries.into_iter().flatten().collect();
+    rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason

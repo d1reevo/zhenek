@@ -100,6 +100,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    build_cs_with(body, threads, lds_bytes, false)
+}
+
+fn build_cs_with(body: &[u32], threads: u32, lds_bytes: u32, wave64: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -116,8 +120,8 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 8,
+        wave64,
+        vgprs: 16,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -1257,5 +1261,261 @@ fn v_cmp_class_f16_matches_rdna2() {
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
+    });
+}
+
+/// `v_add_f64`, `v_cvt_f32_f64`, and `v_cvt_f64_f32` preserve IEEE-754 double
+/// precision (including VOP3 `neg`/`abs`) and emit valid DXIL (`DOUBLES` flag).
+#[test]
+fn f64_add_and_conversions_match_ieee754() {
+    // v[1:2] = in[0..2] (f64 a), v[3:4] = in[2..4] (f64 b).
+    // v[5:6] = v_add_f64(v[1:2], -v[3:4])  (VOP3 0x164, neg bit 1 = 0x2)
+    // v0     = v_cvt_f32_f64(v[5:6])       (VOP1 0x00f)
+    let [add0, add1] = vop3_mod(0x164, 5, vgpr(1), vgpr(3), 0, 0, 0b10, 0, false);
+    let cvt = vop1(0x00f, 0, vgpr(5));
+    let sub_and_cvt = build_valu_cs(&[add0, add1, cvt]);
+
+    // Check SFI0 DOUBLES bit (0x1).
+    let sfi0 = crate::Container::parse(&sub_and_cvt.dxil)
+        .unwrap()
+        .part(crate::FourCC::SFI0)
+        .unwrap()
+        .data;
+    assert_ne!(u64::from_le_bytes(sfi0.try_into().unwrap()) & 0x1, 0);
+
+    let pairs: &[(f64, f64)] = &[
+        (16_777_216.0, -2.0),          // 2^24 - (-2.0) = 16777218.0 (exact in f64)
+        (1e20, 1e20 - 3.5),            // catastrophic cancellation in f32, exact 3.5 in f64
+        (-123.75, 0.25),               // -124.0
+        (0.0, 0.0),                    // 0.0
+    ];
+    let inputs: Vec<[u32; 4]> = pairs
+        .iter()
+        .map(|&(a, b)| {
+            let ab = a.to_bits();
+            let bb = b.to_bits();
+            [ab as u32, (ab >> 32) as u32, bb as u32, (bb >> 32) as u32]
+        })
+        .collect();
+    run_cases(&sub_and_cvt, &inputs, |backend, i, _, got| {
+        let (a, b) = pairs[i];
+        let want = (a - b) as f32;
+        assert_eq!(
+            f32::from_bits(got),
+            want,
+            "{backend}: f32({a} - {b}) = {}, want {want}",
+            f32::from_bits(got)
+        );
+    });
+}
+
+/// `v_permlane16_b32` and `v_permlanex16_b32` permute within and across the
+/// 16-lane rows of each 32-lane half.
+#[test]
+fn permlane16_and_permlanex16_validate_and_run() {
+    // 32 threads: v0 = lane (0..31), s0/s1 = nibble selectors from inputs[0..2].
+    // v1 = v0 + 0x100 (lane l holds 0x100 + l).
+    // v2 = v_permlane16_b32(v1, s0, s1)  -> lane k of own 16-lane row
+    // v3 = v_permlanex16_b32(v2, 0, 0)   -> lane 0 of the OTHER 16-lane row
+    // v0 = v2 + v3                       -> uniform across all 32 lanes!
+    let add_base = [
+        (0x25u32 << 25) | (1u32 << 17) | (0u32 << 9) | 0xFF, // v_add_nc_u32 v1, lit, v0
+        0x100,
+    ];
+    let [p16_0, p16_1] = vop3(0x377, 2, vgpr(1), sgpr(0), sgpr(1));
+    let [px16_0, px16_1] = vop3(0x378, 3, vgpr(2), 0x80, 0x80);
+    let sum = (0x25u32 << 25) | (0u32 << 17) | (3u32 << 9) | vgpr(2) as u32; // v_add_nc_u32 v0, v2, v3
+    let cs = build_cs(&[add_base[0], add_base[1], p16_0, p16_1, px16_0, px16_1, sum], 32, 0);
+
+    // Every nibble selects lane k of the 16-lane row:
+    // row 0 gets 0x100 + k, row 1 gets 0x110 + k -> sum is 0x210 + 2*k.
+    let cases = [
+        ([0x3333_3333, 0x3333_3333, 0, 0], 0x216),
+        ([0x5555_5555, 0x5555_5555, 0, 0], 0x21A),
+        ([0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0], 0x22E),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    // Declares WaveSize(32), which WARP's pipeline creation refuses: hardware only.
+    run_cases_on(&cs, &inputs, &[("hardware", false)], |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(got, want, "{backend}: case {i} got {got:#x}, want {want:#x}");
+    });
+}
+
+/// Scalar 16-bit packing (`s_pack_*_b32_b16`), sign extension (`s_sext_i32_i16`),
+/// and packed f16 multiply-accumulate (`v_pk_fmac_f16`).
+#[test]
+fn scalar16_pack_sext_and_pk_fmac_f16() {
+    // v1 = in[0] (two f16s), v2 = in[1] (two f16s), v0 = in[2] (accumulator two f16s)
+    // v_mov_b32 v0, v3  (load in[2] into v0)
+    // v_pk_fmac_f16 v0, v1, v2  (VOP2 0x3c: v0 = v1 * v2 + v0 on both halves)
+    let mov_acc = vop1(0x001, 0, vgpr(3));
+    let pk_fmac = (0x3Cu32 << 25) | (0u32 << 17) | (2u32 << 9) | vgpr(1) as u32;
+    let cs = build_valu_cs(&[mov_acc, pk_fmac]);
+
+    // f16 bits: 1.0=0x3C00, 2.0=0x4000, 3.0=0x4200, 4.0=0x4400, 5.0=0x4500, 7.0=0x4700, 11.0=0x4980
+    // lo: 2.0 * 3.0 + 1.0 = 7.0 (0x4700); hi: 4.0 * 2.0 + 3.0 = 11.0 (0x4980)
+    let inputs = [[0x4400_4000, 0x4000_4200, 0x4200_3C00, 0]];
+    run_cases(&cs, &inputs, |backend, _, _, got| {
+        assert_eq!(got, 0x4980_4700, "{backend}: v_pk_fmac_f16 = {got:#010x}");
+    });
+
+    // Scalar pack + sign-extend via uniform v_readfirstlane -> s_pack_lh_b32_b16 -> s_sext_i32_i16.
+    let cs_s16 = build_valu_cs(&[
+        vop1(0x002, 20, vgpr(1)),         // v_readfirstlane_b32 s20, v1 (0xAAAA_8001)
+        vop1(0x002, 21, vgpr(2)),         // v_readfirstlane_b32 s21, v2 (0x1234_BBBB)
+        sop2(0x33, 22, 20, 21),           // s_pack_lh_b32_b16 s22, s20, s21 -> 0x1234_8001
+        0xBE80_0000 | (23 << 16) | (0x1A << 8) | 22, // s_sext_i32_i16 s23, s22 -> 0xFFFF_8001
+        sop2(0x12, 24, 22, 23),           // s_xor_b32 s24, s22, s23 -> 0xEDCB_0000
+        vop1(0x001, 0, 24),               // v_mov_b32 v0, s24
+    ]);
+    let inputs_s16 = [[0xAAAA_8001, 0x1234_BBBB, 0, 0]];
+    run_cases(&cs_s16, &inputs_s16, |backend, _, _, got| {
+        assert_eq!(got, 0xEDCB_0000, "{backend}: scalar16 = {got:#010x}");
+    });
+}
+
+/// Wave64 -> Wave32 native adaptation on RTX 5060:
+/// - `v_add_f16` whole-wave reduction across 64 lanes (2 host waves of 32),
+/// - `v_add_f64` whole-wave reduction across 64 lanes via `waveActiveOp.f64` + `exchange_halves2`,
+/// - `ds_bpermute_b32` reading across the 32-lane half boundary (lane 63 - l).
+#[test]
+fn wave64_to_wave32_f16_f64_reductions_and_bpermute_on_rtx5060() {
+    let sop1 = |sdst: u8, op: u8, ssrc0: u8| -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | ssrc0 as u32
+    };
+    let vop2 = |vdst: u8, op: u8, src0: u16, vsrc1: u8| -> u32 {
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+    };
+    let dpp16 = |vsrc0: u8, ctrl: u16| -> u32 {
+        0xF000_0000 | 0x0F00_0000 | (1 << 19) | (ctrl as u32) << 8 | vsrc0 as u32
+    };
+    let s1 = 1 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21;
+    let s2 = 2 | 2 << 3 | 6 << 12 | 6 << 15 | 4 << 18 | 4 << 21;
+    let s4 = 4 | 4 << 3 | 4 << 6 | 4 << 9;
+
+    // 1) Wave64 [64,1,1] v_add_f16 sum over all 64 lanes: each lane contributes input[0] (f16).
+    // Result across 64 lanes = 64 * input[0].
+    let cnd_f16 = vop3(0x101, 6, 128, vgpr(1), 16); // v_cndmask_b32 v6, 0, v1, s[16:17]
+    let dpp8_f16 = |sel: u32| [vop2(6, 0x32, 233, 6), sel << 8 | 6];
+    let mirror_f16 = [vop2(6, 0x32, 250, 6), dpp16(6, 0x140)];
+    let px16_f16 = vop3(0x378, 7, vgpr(6), 128, 128);
+    let add_rows_f16 = vop2(6, 0x32, vgpr(7), 6);
+    let rl32_f16 = vop3(0x360, 18, vgpr(6), 160, 0);
+    let add_halves_f16 = vop2(6, 0x32, 18, 6);
+    let rl0_f16 = vop3(0x360, 18, vgpr(6), 128, 0);
+    let cs_f16 = build_cs_with(
+        &[
+            sop1(16, 0x25, 193), // s_or_saveexec_b64 s[16:17], -1
+            cnd_f16[0],
+            cnd_f16[1],
+            dpp8_f16(s1)[0],
+            dpp8_f16(s1)[1],
+            dpp8_f16(s2)[0],
+            dpp8_f16(s2)[1],
+            dpp8_f16(s4)[0],
+            dpp8_f16(s4)[1],
+            mirror_f16[0],
+            mirror_f16[1],
+            px16_f16[0],
+            px16_f16[1],
+            add_rows_f16,
+            rl32_f16[0],
+            rl32_f16[1],
+            add_halves_f16,
+            rl0_f16[0],
+            rl0_f16[1],
+            sop1(126, 0x04, 16), // s_mov_b64 exec, s[16:17]
+            vop1(0x001, 0, sgpr(18)), // v_mov_b32 v0, s18
+        ],
+        64,
+        0,
+        true,
+    );
+    // f16 0.25 (0x3400) * 64 = 16.0 (0x4C00); f16 1.5 (0x3E00) * 64 = 96.0 (0x5600)
+    let f16_cases = [
+        ([0x3400, 0, 0, 0], 0x4C00),
+        ([0x3E00, 0, 0, 0], 0x5600),
+    ];
+    let f16_in: Vec<[u32; 4]> = f16_cases.iter().map(|c| c.0).collect();
+    run_cases_on(&cs_f16, &f16_in, &[("hardware", false)], |backend, i, _, got| {
+        assert_eq!(got, f16_cases[i].1, "{backend}: f16 wave64 sum got {got:#x}");
+    });
+
+    // 2) Wave64 [64,1,1] v_add_f64 sum over all 64 lanes: each lane holds f64(input[0..2]),
+    // summed across 64 lanes -> converted to f32 in v0.
+    let cnd_lo = vop3(0x101, 6, vgpr(6), vgpr(1), 16);
+    let cnd_hi = vop3(0x101, 7, vgpr(7), vgpr(2), 16);
+    let mov_dpp8 = |vd: u8, vs: u8, sel: u32| [vop1(1, vd, 233), sel << 8 | u32::from(vs)];
+    let mov_mirror = |vd: u8, vs: u8| [vop1(1, vd, 250), dpp16(vs, 0x140)];
+    let add64_vv = vop3(0x164, 6, vgpr(8), vgpr(6), 0);
+    let add64_sv = vop3(0x164, 6, 18, vgpr(6), 0);
+    let px16_lo = vop3(0x378, 8, vgpr(6), 128, 128);
+    let px16_hi = vop3(0x378, 9, vgpr(7), 128, 128);
+    let rl32_lo = vop3(0x360, 18, vgpr(6), 160, 0);
+    let rl32_hi = vop3(0x360, 19, vgpr(7), 160, 0);
+    let rl0_lo = vop3(0x360, 18, vgpr(6), 128, 0);
+    let rl0_hi = vop3(0x360, 19, vgpr(7), 128, 0);
+    let mut f64_body = vec![
+        sop1(16, 0x25, 193), // s_or_saveexec_b64 s[16:17], -1
+        vop1(1, 6, 128),
+        vop1(1, 7, 128),
+        cnd_lo[0],
+        cnd_lo[1],
+        cnd_hi[0],
+        cnd_hi[1],
+    ];
+    for sel in [s1, s2, s4] {
+        f64_body.extend_from_slice(&mov_dpp8(8, 6, sel));
+        f64_body.extend_from_slice(&mov_dpp8(9, 7, sel));
+        f64_body.extend_from_slice(&add64_vv);
+    }
+    f64_body.extend_from_slice(&mov_mirror(8, 6));
+    f64_body.extend_from_slice(&mov_mirror(9, 7));
+    f64_body.extend_from_slice(&add64_vv);
+    f64_body.extend_from_slice(&px16_lo);
+    f64_body.extend_from_slice(&px16_hi);
+    f64_body.extend_from_slice(&add64_vv);
+    f64_body.extend_from_slice(&rl32_lo);
+    f64_body.extend_from_slice(&rl32_hi);
+    f64_body.extend_from_slice(&add64_sv);
+    f64_body.extend_from_slice(&rl0_lo);
+    f64_body.extend_from_slice(&rl0_hi);
+    f64_body.push(sop1(20, 0x03, 18)); // s_mov_b32 s20, s18
+    f64_body.push(sop1(21, 0x03, 19)); // s_mov_b32 s21, s19
+    f64_body.push(sop1(126, 0x04, 16)); // s_mov_b64 exec, s[16:17]
+    f64_body.push(vop1(0x00F, 0, sgpr(20))); // v_cvt_f32_f64 v0, s[20:21]
+    let cs_f64 = build_cs_with(&f64_body, 64, 0, true);
+    let val = 1.25f64.to_bits();
+    let f64_in = [[val as u32, (val >> 32) as u32, 0, 0]];
+    run_cases_on(&cs_f64, &f64_in, &[("hardware", false)], |backend, _, _, got| {
+        assert_eq!(
+            f32::from_bits(got),
+            80.0f32,
+            "{backend}: f64 wave64 sum got {}",
+            f32::from_bits(got)
+        );
+    });
+
+    // 3) Wave64 [64,1,1] cross-half ds_bpermute_b32:
+    // Each lane l sets v6 = v0 + v1 (l + base), computes target = (63 - l) << 2,
+    // permutes v7 = bpermute(target, v6), and returns v0 = v6 + v7 (= 63 + 2*base for every lane!).
+    let cs_bp = build_cs_with(
+        &[
+            vop2(6, 0x25, vgpr(1), 0), // v_add_nc_u32 v6, v1, v0  (base + l)
+            vop2(5, 0x1D, 128 + 63, 0), // v_xor_b32 v5, 63, v0    (63 - l)
+            vop2(5, 0x1A, 128 + 2, 5), // v_lshlrev_b32 v5, 2, v5  ((63 - l) << 2)
+            0xD800_0000 | (0xB3 << 18),
+            (7 << 24) | (6 << 8) | 5, // ds_bpermute_b32 v7, v5, v6
+            vop2(0, 0x25, vgpr(6), 7), // v_add_nc_u32 v0, v6, v7  (63 + 2*base)
+        ],
+        64,
+        0,
+        true,
+    );
+    let bp_in = [[100, 0, 0, 0], [1000, 0, 0, 0]];
+    run_cases_on(&cs_bp, &bp_in, &[("hardware", false)], |backend, i, _, got| {
+        let want = 63 + 2 * bp_in[i][0];
+        assert_eq!(got, want, "{backend}: ds_bpermute wave64 got {got}, want {want}");
     });
 }

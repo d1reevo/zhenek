@@ -1650,6 +1650,14 @@ fn host_texture(
         d.format = target_format(d.format);
     }
     const DENY_SHADER_RESOURCE: u32 = 8;
+    #[cfg(windows)]
+    if crate::relight::enabled()
+        && d.flags & DEPTH != 0
+        && matches!(d.format, 19 | 20)
+        && d.dimension == 3 && d.sample_count <= 1 && d.width >= 960 && d.height >= 540
+    {
+        d.flags &= !DENY_SHADER_RESOURCE;
+    }
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
     {

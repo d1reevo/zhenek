@@ -618,9 +618,33 @@ impl<'a> Tracer<'a> {
             return None;
         }
         let dynamic = address.dynamic?;
+        let mut extra_bytes = 0u32;
         let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
-            Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
-            _ => (dynamic, 0),
+            Some((_, [Term::Value(input), Term::Const(shift)])) => {
+                let shift = (shift & 31) as u8;
+                if let Some((_, [Term::Value(inner), Term::Const(k)] | [Term::Const(k), Term::Value(inner)])) =
+                    self.sop2(input, &["s_add_u32", "s_add_i32"])
+                {
+                    extra_bytes = k.wrapping_shl(u32::from(shift));
+                    (inner, shift)
+                } else if let Some((Term::Value(inner), k)) = self.sopk_add(input) {
+                    extra_bytes = k.wrapping_shl(u32::from(shift));
+                    (inner, shift)
+                } else {
+                    (input, shift)
+                }
+            }
+            _ => match self.sop2(dynamic, &["s_mul_i32"]) {
+                Some((_, [Term::Value(input), Term::Const(scale)] | [Term::Const(scale), Term::Value(input)]))
+                    if scale.is_power_of_two() =>
+                {
+                    (input, scale.trailing_zeros() as u8)
+                }
+                _ => match self.lshl_add(dynamic) {
+                    Some((k, [Term::Value(input), _])) => (input, k as u8),
+                    _ => (dynamic, 0),
+                },
+            },
         };
         let (param, constant_dword) = self.param_of(self.inputs[input.0 as usize]?)?;
         let constant = self.layout.get(param)?;
@@ -631,9 +655,101 @@ impl<'a> Tracer<'a> {
             table_slot: base.slot,
             constant_slot: constant.slot,
             constant_dword,
-            byte_offset: address.offset.wrapping_add(u32::from(first) * 4),
+            byte_offset: address
+                .offset
+                .wrapping_add(extra_bytes)
+                .wrapping_add(u32::from(first) * 4),
             shift,
         })
+    }
+
+    /// Whether `v` is the first SGPR of a heap or descriptor-table root parameter
+    /// (whose host lowering reads the instruction's base SGPR directly rather than
+    /// re-adding `Address::dynamic`).
+    fn is_heap_base(&self, v: Value) -> bool {
+        let Some(reg) = self.inputs[v.0 as usize] else {
+            return false;
+        };
+        let Some((param, 0)) = self.param_of(reg) else {
+            return false;
+        };
+        matches!(
+            self.layout[param].root,
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+        )
+    }
+
+    /// `s_addk_i32 dst, simm16`: returns `(old_dst_term, sign_extended_imm)`.
+    fn sopk_add(&self, v: Value) -> Option<(Term, u32)> {
+        let inst = self.def(v)?;
+        if inst.name() != "s_addk_i32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            imm: Some(imm),
+            ..
+        } = &inst.fields
+        else {
+            return None;
+        };
+        let prev = self.origin(inst.read(Reg::S(*code))?);
+        Some((prev, i32::from(*imm as i16) as u32))
+    }
+
+    /// `s_lshl{1..4}_add_u32 dst, src0, src1` or `v_lshl_add_u32 dst, src0, const_shift, src2`:
+    /// computes `(src0 << shift) + base_term`.
+    fn lshl_add(&self, v: Value) -> Option<(u32, [Term; 2])> {
+        let inst = self.def(v)?;
+        let name = inst.name();
+        if let Some(shift) = match name {
+            "s_lshl1_add_u32" => Some(1u32),
+            "s_lshl2_add_u32" => Some(2),
+            "s_lshl3_add_u32" => Some(3),
+            "s_lshl4_add_u32" => Some(4),
+            _ => None,
+        } {
+            if inst.writes.first()?.1 != v {
+                return None;
+            }
+            let Fields::Sop { src, .. } = &inst.fields else {
+                return None;
+            };
+            return Some((
+                shift,
+                [
+                    self.term(inst, src.first()?)?,
+                    self.term(inst, src.get(1)?)?,
+                ],
+            ));
+        }
+        if name == "v_lshl_add_u32" {
+            let Fields::Valu(f) = &inst.fields else {
+                return None;
+            };
+            let Some(Operand::Vector { reg, .. }) = f.dst else {
+                return None;
+            };
+            if inst.write(Reg::V(reg)) != Some(v)
+                || f.abs != 0
+                || f.neg != 0
+                || f.sdwa.is_some()
+                || f.dpp.is_some()
+            {
+                return None;
+            }
+            let Term::Const(shift) = self.vterm(inst, f.src.get(1)?)? else {
+                return None;
+            };
+            return Some((
+                shift & 31,
+                [
+                    self.vterm(inst, f.src.first()?)?,
+                    self.vterm(inst, f.src.get(2)?)?,
+                ],
+            ));
+        }
+        None
     }
 
     fn sum(&self, t: Term) -> Sum {
@@ -669,6 +785,21 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        // Constant scalar shift/multiply in address expressions (e.g. table offsets).
+        if let Some((_, [Term::Const(a), Term::Const(b)])) = self.sop2(v, &["s_lshl_b32"]) {
+            return Sum {
+                base: None,
+                offset: a.wrapping_shl(b & 31),
+                dynamic: None,
+            };
+        }
+        if let Some((_, [Term::Const(a), Term::Const(b)])) = self.sop2(v, &["s_mul_i32"]) {
+            return Sum {
+                base: None,
+                offset: a.wrapping_mul(b),
+                dynamic: None,
+            };
+        }
         // Paths that each add an index to a table in the code and meet before one
         // load: the join itself is the computed term. Lowering gives every
         // `s_getpc_b64` its own offset in the code as its value, so the join is the
@@ -697,6 +828,54 @@ impl<'a> Tracer<'a> {
                 dynamic
             };
         }
+        if let Some((prev, imm)) = self.sopk_add(v) {
+            let mut s = self.sum(prev);
+            s.offset = s.offset.wrapping_add(imm);
+            return s;
+        }
+        if let Some((shift, [shifted, addend])) = self.lshl_add(v) {
+            let y = self.sum(addend);
+            if let Term::Const(c) = shifted {
+                return Sum {
+                    base: y.base,
+                    offset: y.offset.wrapping_add(c.wrapping_shl(shift)),
+                    dynamic: y.dynamic,
+                };
+            }
+            if shift == 0 {
+                let x = self.sum(shifted);
+                if x.base.is_some() && y.base.is_some() {
+                    return dynamic;
+                }
+                if x.dynamic.is_some() && y.dynamic.is_some() {
+                    return match x.base.or(y.base) {
+                        Some(b) if self.is_heap_base(b) => Sum {
+                            base: Some(b),
+                            offset: 0,
+                            dynamic: Some(v),
+                        },
+                        _ => dynamic,
+                    };
+                }
+                return Sum {
+                    base: x.base.or(y.base),
+                    offset: x.offset.wrapping_add(y.offset),
+                    dynamic: x.dynamic.or(y.dynamic),
+                };
+            }
+            // `(dyn << shift) + heap_base`: keep the heap root parameter; lowering
+            // reads the instruction's base SGPR directly for heap/table loads.
+            if let Some(b) = y.base
+                && self.is_heap_base(b)
+            {
+                return Sum {
+                    base: Some(b),
+                    offset: y.offset,
+                    dynamic: Some(v),
+                };
+            }
+            return dynamic;
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -705,8 +884,20 @@ impl<'a> Tracer<'a> {
             return dynamic;
         };
         let (x, y) = (self.sum(a), self.sum(b));
-        if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
+        if x.base.is_some() && y.base.is_some() {
             return dynamic;
+        }
+        if x.dynamic.is_some() && y.dynamic.is_some() {
+            // Multi-step dynamic offset added to a heap/table root base: keep
+            // the root parameter tracked and record `v` as the dynamic term.
+            return match x.base.or(y.base) {
+                Some(b) if self.is_heap_base(b) => Sum {
+                    base: Some(b),
+                    offset: 0,
+                    dynamic: Some(v),
+                },
+                _ => dynamic,
+            };
         }
         Sum {
             base: x.base.or(y.base),
@@ -1079,13 +1270,22 @@ impl<'a> Tracer<'a> {
 
     /// The terms of the additions that compute `v`.
     fn leaves(&self, v: Value) -> Box<dyn Iterator<Item = Value> + '_> {
-        match self.sop2(v, &["s_add_u32", "s_add_i32"]) {
-            Some((_, terms)) => Box::new(terms.into_iter().flat_map(move |t| match t {
+        if let Some((prev, _)) = self.sopk_add(v) {
+            return match prev {
                 Term::Value(x) => self.leaves(x),
                 Term::Const(_) => Box::new(std::iter::empty()),
-            })),
-            None => Box::new(std::iter::once(v)),
+            };
         }
+        if let Some((_, terms)) = self
+            .sop2(v, &["s_add_u32", "s_add_i32"])
+            .or_else(|| self.lshl_add(v).map(|(_, t)| (self.def(v).unwrap(), t)))
+        {
+            return Box::new(terms.into_iter().flat_map(move |t| match t {
+                Term::Value(x) => self.leaves(x),
+                Term::Const(_) => Box::new(std::iter::empty()),
+            }));
+        }
+        Box::new(std::iter::once(v))
     }
 
     fn smem_address(
@@ -3844,5 +4044,51 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn traces_sopk_add_lshl_add_and_multi_step_dynamic_heap_offsets() {
+        // s0 = Table base, s2 = root constant index0, s3 = root constant index1
+        // s_mov_b32 s1, 0
+        // s_addk_i32 s0, 0x20              -> s0 = table + 0x20
+        // s_lshl2_add_u32 s4, s2, s0       -> s4 = (s2 << 2) + table + 0x20
+        // s_add_u32 s4, s4, s3             -> multi-step dynamic sum on table base
+        // s_load_dwordx4 s[8:11], s[4:5? -> use s[4:5] with s5=0], 0
+        let words: [u32; 9] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xB780_0020, // s_addk_i32 s0, 0x20
+            0x9784_0002, // s_lshl2_add_u32 s4, s2, s0 (SOP2 op=0x2f: 0x8000_0000 | 0x2f<<23 | 4<<16 | 0<<8 | 2)
+            0x8004_0304, // s_add_u32 s4, s4, s3
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,
+            0xF420_0284, // s_buffer_load_dword s10, s[8:11], 0
+            0xFA00_0000,
+            0xBF81_0000,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 4).unwrap();
+        let layout = vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ];
+        let r = track(&p, &layout, HwStage::Cs, None).unwrap();
+        assert_eq!(r.scalar.len(), 1);
+        assert_eq!(r.scalar[0].1.param, 0);
+        assert!(r.scalar[0].1.dynamic.is_some());
+        assert_eq!(r.descriptors.len(), 1);
     }
 }

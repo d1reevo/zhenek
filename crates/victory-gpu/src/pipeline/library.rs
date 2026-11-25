@@ -62,6 +62,13 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// Folder beside `pipelines` for saving failed graphics shader containers.
+pub(crate) fn failed_shader_dir() -> Option<PathBuf> {
+    DIR.get()
+        .and_then(|dir| dir.parent())
+        .map(|cache| cache.join("failed-shaders"))
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);

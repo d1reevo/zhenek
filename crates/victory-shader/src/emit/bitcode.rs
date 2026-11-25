@@ -15,6 +15,7 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -47,6 +48,7 @@ struct Global {
 enum Const {
     Int(i64),
     Float(u32),
+    Double(u64),
     Undef,
     Aggregate(Vec<u32>),
 }
@@ -92,6 +94,8 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpTrunc = 7,
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -208,6 +212,7 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    pub f32_denorm_mode: Option<&'static str>,
 }
 
 impl Module {
@@ -229,6 +234,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn double(&mut self) -> Ty {
+        self.ty(TypeDef::Double)
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -278,6 +286,10 @@ impl Module {
     pub fn f32(&mut self, bits: u32) -> V {
         let t = self.float();
         self.constant(t, Const::Float(bits))
+    }
+    pub fn f64(&mut self, bits: u64) -> V {
+        let t = self.double();
+        self.constant(t, Const::Double(bits))
     }
     pub fn undef(&mut self, ty: Ty) -> V {
         self.constant(ty, Const::Undef)
@@ -486,6 +498,576 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    /// Bit-exact SSA simplification and dead pure instruction elimination.
+    ///
+    /// Collapses redundant bitcasts (`bitcast(bitcast(x))`, `bitcast(const)`),
+    /// bit-exact integer identities (`x + 0`, `x & -1`, `select(c, x, x)`,
+    /// constant integer ops), trivial phis, and drops unused pure instructions
+    /// (dead float↔int bitcasts, dead SCC flags, dead arithmetic/extracts).
+    /// Control flow and all side-effecting or flag-bearing calls are left
+    /// intact, preserving bit-for-bit semantics and DXIL validator invariants.
+    pub fn optimize(&mut self) {
+        let n = self.insts.len();
+        if n == 0 {
+            return;
+        }
+        let mut replace: Vec<V> = (0..n).map(|i| V::Inst(i as u32)).collect();
+        let resolve = |replace: &[V], mut v: V| -> V {
+            let mut steps = 0;
+            while let V::Inst(i) = v {
+                let next = replace[i as usize];
+                if next == v || steps >= 32 {
+                    break;
+                }
+                v = next;
+                steps += 1;
+            }
+            v
+        };
+
+        for _ in 0..8 {
+            let mut changed = false;
+            // Rewrite operands of all instructions through `replace`.
+            for inst in &mut self.insts {
+                rewrite_operands(&mut inst.op, |v| {
+                    let r = resolve(&replace, v);
+                    if r != v {
+                        changed = true;
+                    }
+                    r
+                });
+            }
+            for b in &mut self.blocks {
+                if let Some(Term::CondBr(c, t, f)) = b.term {
+                    let rc = resolve(&replace, c);
+                    if rc != c {
+                        b.term = Some(Term::CondBr(rc, t, f));
+                        changed = true;
+                    }
+                }
+            }
+
+            changed |= self.prune_constant_branches();
+
+            // Simplify instructions in-place into `replace`.
+            for i in 0..n {
+                let self_v = V::Inst(i as u32);
+                if replace[i] != self_v {
+                    continue;
+                }
+                let ty = self.insts[i].ty;
+                let simplified: Option<V> = match &self.insts[i].op {
+                    Op::Phi(incoming) => {
+                        let mut only = None;
+                        let mut trivial = true;
+                        for &(v, _) in incoming {
+                            let v = resolve(&replace, v);
+                            if v == self_v || Some(v) == only {
+                                continue;
+                            }
+                            if only.is_some() {
+                                trivial = false;
+                                break;
+                            }
+                            only = Some(v);
+                        }
+                        if trivial { only } else { None }
+                    }
+                    Op::Cast(Cast::Bitcast, v) => {
+                        let v = resolve(&replace, *v);
+                        if self.type_of(v) == ty {
+                            Some(v)
+                        } else if let V::Inst(j) = v
+                            && let Op::Cast(Cast::Bitcast, orig) = self.insts[j as usize].op
+                            && {
+                                let orig = resolve(&replace, orig);
+                                self.type_of(orig) == ty
+                            }
+                        {
+                            Some(resolve(&replace, orig))
+                        } else if let V::Const(ci) = v {
+                            match (&self.consts[ci as usize].1, &self.types[ty.0 as usize]) {
+                                (Const::Int(x), TypeDef::Float) => Some(self.f32(*x as u32)),
+                                (Const::Float(bits), TypeDef::Int(32)) => Some(self.i32(*bits)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Op::Cast(op @ (Cast::ZExt | Cast::SExt), v) => {
+                        let v = resolve(&replace, *v);
+                        if let V::Const(ci) = v
+                            && let (TypeDef::Int(1), Const::Int(cv)) =
+                                (&self.types[self.consts[ci as usize].0.0 as usize], &self.consts[ci as usize].1)
+                            && self.types[ty.0 as usize] == TypeDef::Int(32)
+                        {
+                            let val = if *cv == 0 {
+                                0u32
+                            } else if *op == Cast::ZExt {
+                                1u32
+                            } else {
+                                u32::MAX
+                            };
+                            Some(self.i32(val))
+                        } else {
+                            None
+                        }
+                    }
+                    Op::Select(c, t, f) => {
+                        let (c, t, f) = (
+                            resolve(&replace, *c),
+                            resolve(&replace, *t),
+                            resolve(&replace, *f),
+                        );
+                        if t == f {
+                            Some(t)
+                        } else if let Some(cv) = self.int_value(c) {
+                            Some(if cv != 0 { t } else { f })
+                        } else {
+                            None
+                        }
+                    }
+                    Op::Bin(op, a, b) => {
+                        let (op, a, b) = (*op, resolve(&replace, *a), resolve(&replace, *b));
+                        match self.types[ty.0 as usize] {
+                            TypeDef::Int(32) => {
+                                let (ac, bc) = (
+                                    self.int_value(a).map(|x| x as u32),
+                                    self.int_value(b).map(|x| x as u32),
+                                );
+                                match (op, ac, bc) {
+                                    (Bin::Add, Some(x), Some(y)) => Some(self.i32(x.wrapping_add(y))),
+                                    (Bin::Sub, Some(x), Some(y)) => Some(self.i32(x.wrapping_sub(y))),
+                                    (Bin::Mul, Some(x), Some(y)) => Some(self.i32(x.wrapping_mul(y))),
+                                    (Bin::And, Some(x), Some(y)) => Some(self.i32(x & y)),
+                                    (Bin::Or, Some(x), Some(y)) => Some(self.i32(x | y)),
+                                    (Bin::Xor, Some(x), Some(y)) => Some(self.i32(x ^ y)),
+                                    (Bin::Shl, Some(x), Some(y)) if y < 32 => Some(self.i32(x << y)),
+                                    (Bin::LShr, Some(x), Some(y)) if y < 32 => Some(self.i32(x >> y)),
+                                    (Bin::AShr, Some(x), Some(y)) if y < 32 => {
+                                        Some(self.i32(((x as i32) >> y) as u32))
+                                    }
+                                    (Bin::Add | Bin::Or | Bin::Xor, _, Some(0))
+                                    | (Bin::Sub | Bin::Shl | Bin::LShr | Bin::AShr, _, Some(0))
+                                    | (Bin::And, _, Some(u32::MAX))
+                                    | (Bin::Mul, _, Some(1)) => Some(a),
+                                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _)
+                                    | (Bin::And, Some(u32::MAX), _)
+                                    | (Bin::Mul, Some(1), _) => Some(b),
+                                    (Bin::And | Bin::Mul, Some(0), _)
+                                    | (Bin::And | Bin::Mul, _, Some(0)) => Some(self.i32(0)),
+                                    (Bin::Or, Some(u32::MAX), _)
+                                    | (Bin::Or, _, Some(u32::MAX)) => Some(self.i32(u32::MAX)),
+                                    (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                                    (Bin::Xor | Bin::Sub, _, _) if a == b => Some(self.i32(0)),
+                                    _ => None,
+                                }
+                            }
+                            TypeDef::Int(1) => {
+                                let (ac, bc) = (
+                                    self.int_value(a).map(|x| x != 0),
+                                    self.int_value(b).map(|x| x != 0),
+                                );
+                                match (op, ac, bc) {
+                                    (Bin::And, Some(x), Some(y)) => Some(self.bool(x && y)),
+                                    (Bin::Or, Some(x), Some(y)) => Some(self.bool(x || y)),
+                                    (Bin::Xor, Some(x), Some(y)) => Some(self.bool(x ^ y)),
+                                    (Bin::And, _, Some(true))
+                                    | (Bin::Or | Bin::Xor, _, Some(false)) => Some(a),
+                                    (Bin::And, Some(true), _)
+                                    | (Bin::Or | Bin::Xor, Some(false), _) => Some(b),
+                                    (Bin::And, Some(false), _) | (Bin::And, _, Some(false)) => {
+                                        Some(self.bool(false))
+                                    }
+                                    (Bin::Or, Some(true), _) | (Bin::Or, _, Some(true)) => {
+                                        Some(self.bool(true))
+                                    }
+                                    (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                                    (Bin::Xor, _, _) if a == b => Some(self.bool(false)),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    Op::Cmp(p, a, b) => {
+                        let (p, a, b) = (*p, resolve(&replace, *a), resolve(&replace, *b));
+                        if self.types[self.type_of(a).0 as usize] == TypeDef::Int(32)
+                            && let (Some(av), Some(bv)) = (self.int_value(a), self.int_value(b))
+                        {
+                            let (au, bu) = (av as u32, bv as u32);
+                            let (ai, bi) = (av as i32, bv as i32);
+                            let res = match p {
+                                pred::EQ => Some(au == bu),
+                                pred::NE => Some(au != bu),
+                                pred::IUGT => Some(au > bu),
+                                pred::IUGE => Some(au >= bu),
+                                pred::IULT => Some(au < bu),
+                                pred::IULE => Some(au <= bu),
+                                pred::SGT => Some(ai > bi),
+                                pred::SGE => Some(ai >= bi),
+                                pred::SLT => Some(ai < bi),
+                                pred::SLE => Some(ai <= bi),
+                                _ => None,
+                            };
+                            res.map(|r| self.bool(r))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(to) = simplified
+                    && to != self_v
+                {
+                    replace[i] = to;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Final rewrite pass for instructions, terminators, and metadata values.
+        for inst in &mut self.insts {
+            rewrite_operands(&mut inst.op, |v| resolve(&replace, v));
+        }
+        for b in &mut self.blocks {
+            if let Some(Term::CondBr(c, t, f)) = b.term {
+                b.term = Some(Term::CondBr(resolve(&replace, c), t, f));
+            }
+        }
+        for m in &mut self.mds {
+            if let MdDef::Value(_, v) = m {
+                *v = resolve(&replace, *v);
+            }
+        }
+
+        self.prune_constant_branches();
+
+        // Worklist DCE over all instructions: keep only side-effecting roots,
+        // flag/resource/signature intrinsics, branch conditions, and their
+        // transitive operand dependencies.
+        let mut live = vec![false; n];
+        let mut work: Vec<u32> = Vec::new();
+        let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
+            if let V::Inst(i) = v
+                && !live[i as usize]
+            {
+                live[i as usize] = true;
+                work.push(i);
+            }
+        };
+        let is_pure_call = |funcs: &[Func], f: u32| -> bool {
+            let func = &funcs[f as usize];
+            func.attr == Some(Attr::ReadNone)
+                && matches!(
+                    func.name.as_str(),
+                    "dx.op.unary.f32"
+                        | "dx.op.binary.f32"
+                        | "dx.op.tertiary.f32"
+                        | "dx.op.isSpecialFloat.f32"
+                        | "dx.op.unary.i32"
+                        | "dx.op.binary.i32"
+                        | "dx.op.tertiary.i32"
+                        | "dx.op.unaryBits.i32"
+                        | "dx.op.legacyF16ToF32"
+                        | "dx.op.legacyF32ToF16"
+                )
+        };
+        let is_pure_op = |op: &Op, types: &[TypeDef], funcs: &[Func]| -> bool {
+            match op {
+                Op::Bin(..)
+                | Op::Cast(..)
+                | Op::Cmp(..)
+                | Op::Select(..)
+                | Op::Extract(..)
+                | Op::Gep(..)
+                | Op::Phi(..) => true,
+                Op::Load(ptr) => {
+                    let pt = match *ptr {
+                        V::Global(g) => self.globals[g as usize].ptr,
+                        V::Inst(j) => self.insts[j as usize].ty,
+                        _ => return false,
+                    };
+                    matches!(types[pt.0 as usize], TypeDef::Ptr(_, 0 | 3))
+                }
+                Op::Call(f, _) => is_pure_call(funcs, *f),
+                Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => false,
+            }
+        };
+
+        for m in &self.mds {
+            if let MdDef::Value(_, v) = m {
+                mark(&mut live, &mut work, *v);
+            }
+        }
+        for b in &self.blocks {
+            for &i in &b.body {
+                if !is_pure_op(&self.insts[i as usize].op, &self.types, &self.funcs) {
+                    mark(&mut live, &mut work, V::Inst(i));
+                }
+            }
+            if let Some(Term::CondBr(c, ..)) = b.term {
+                mark(&mut live, &mut work, c);
+            }
+        }
+        while let Some(i) = work.pop() {
+            for_each_operand(&self.insts[i as usize].op, |v| {
+                mark(&mut live, &mut work, v);
+            });
+        }
+        for b in &mut self.blocks {
+            b.phis.retain(|&i| live[i as usize]);
+            b.body.retain(|&i| live[i as usize]);
+        }
+
+        // Drop unused external function declarations: DXIL validator rejects
+        // external `dx.op.*` declarations with zero remaining call sites.
+        let mut used_func = vec![false; self.funcs.len()];
+        for (fi, f) in self.funcs.iter().enumerate() {
+            if f.body {
+                used_func[fi] = true;
+            }
+        }
+        for b in &self.blocks {
+            for &i in &b.body {
+                if let Op::Call(fi, _) = self.insts[i as usize].op {
+                    used_func[fi as usize] = true;
+                }
+            }
+        }
+        if used_func.iter().any(|&u| !u) {
+            let mut remap = vec![0u32; self.funcs.len()];
+            let mut new_funcs = Vec::with_capacity(self.funcs.len());
+            let mut new_ids = HashMap::with_capacity(self.funcs.len());
+            for (old, f) in self.funcs.drain(..).enumerate() {
+                if used_func[old] {
+                    let ni = new_funcs.len() as u32;
+                    remap[old] = ni;
+                    new_ids.insert(f.name.clone(), ni);
+                    new_funcs.push(f);
+                }
+            }
+            self.funcs = new_funcs;
+            self.func_ids = new_ids;
+            for inst in &mut self.insts {
+                if let Op::Call(fi, _) = &mut inst.op {
+                    *fi = remap[*fi as usize];
+                }
+            }
+            for m in &mut self.mds {
+                if let MdDef::Value(_, V::Func(fi)) = m {
+                    *fi = remap[*fi as usize];
+                }
+            }
+        }
+    }
+
+    /// The optimizer can remove the only references to a code table or
+    /// LDS variable. DXIL rejects dead internal global declarations.
+    pub fn prune_unused_globals(&mut self) {
+        if self.globals.is_empty() {
+            return;
+        }
+        let mut live = vec![false; self.globals.len()];
+        let mut mark = |v| {
+            if let V::Global(i) = v {
+                live[i as usize] = true;
+            }
+        };
+        for b in &self.blocks {
+            for &i in b.phis.iter().chain(&b.body) {
+                for_each_operand(&self.insts[i as usize].op, &mut mark);
+            }
+        }
+        for md in &self.mds {
+            if let MdDef::Value(_, v) = md {
+                mark(*v);
+            }
+        }
+        if live.iter().all(|&used| used) {
+            return;
+        }
+        let mut next = 0;
+        let mut remap = vec![0; live.len()];
+        for (i, used) in live.iter().copied().enumerate() {
+            if used {
+                remap[i] = next;
+                next += 1;
+            }
+        }
+        let rewrite = |v| match v {
+            V::Global(i) => V::Global(remap[i as usize]),
+            _ => v,
+        };
+        let mut n = 0;
+        self.globals.retain(|_| {
+            let used = live[n];
+            n += 1;
+            used
+        });
+        for b in &self.blocks {
+            for &i in b.phis.iter().chain(&b.body) {
+                rewrite_operands(&mut self.insts[i as usize].op, rewrite);
+            }
+        }
+        for md in &mut self.mds {
+            if let MdDef::Value(_, v) = md {
+                *v = rewrite(*v);
+            }
+        }
+    }
+
+    pub fn heap_usage(&self) -> (bool, bool) {
+        let mut usage = (false, false);
+        let Some(&handle) = self.func_ids.get("dx.op.createHandleFromHeap") else {
+            return usage;
+        };
+        for i in self.blocks.iter().flat_map(|b| &b.body) {
+            if let Op::Call(id, args) = &self.insts[*i as usize].op
+                && *id == handle
+            {
+                if self.int_value(args[2]) == Some(0) {
+                    usage.0 = true;
+                } else {
+                    usage.1 = true;
+                }
+            }
+        }
+        usage
+    }
+
+    pub fn uses_waves(&self) -> bool {
+        self.funcs.iter().any(|f| f.name.starts_with("dx.op.wave") || f.name.starts_with("dx.op.quad"))
+    }
+
+    pub fn uses_implicit_sampling(&self) -> bool {
+        [
+            "dx.op.sample.f32",
+            "dx.op.sampleBias.f32",
+            "dx.op.sampleCmp.f32",
+            "dx.op.calculateLOD.f32",
+            "dx.op.textureGather.f32",
+        ]
+        .iter()
+        .any(|op| self.func_ids.contains_key(*op))
+    }
+
+    /// Predecessors of reachable blocks in the emitted CFG.
+    pub fn predecessors(&self) -> Vec<Vec<usize>> {
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for from in self.block_order() {
+            for &to in successors(self.blocks[from].term).iter() {
+                preds[to].push(from);
+            }
+        }
+        preds
+    }
+
+    fn block_order(&self) -> Vec<usize> {
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    /// Drop impossible CFG edges before writing LLVM. Even a branch with
+    /// a literal condition contributes both edges to LLVM's dominator
+    /// tree until it is folded; phis must follow the surviving edges.
+    fn prune_constant_branches(&mut self) -> bool {
+        let mut folded = false;
+        for block in &mut self.blocks {
+            if let Some(Term::CondBr(V::Const(i), yes, no)) = block.term
+                && let Const::Int(c) = self.consts[i as usize].1
+            {
+                block.term = Some(Term::Br(if c != 0 { yes } else { no }));
+                folded = true;
+            }
+        }
+        if !folded {
+            return false;
+        }
+        let order = self.block_order();
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        let mut live = vec![false; self.blocks.len()];
+        for b in order {
+            live[b] = true;
+            for &to in successors(self.blocks[b].term).iter() {
+                preds[to].push(b);
+            }
+        }
+        for (b, block) in self.blocks.iter_mut().enumerate() {
+            if !live[b] {
+                *block = Block::default();
+                continue;
+            }
+            for &i in &block.phis {
+                if let Op::Phi(inc) = &mut self.insts[i as usize].op {
+                    inc.retain(|&(_, pred)| preds[b].contains(&pred));
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether any instruction remaining in the blocks uses `i64` (as result or operand).
+    pub fn has_live_int64(&self) -> bool {
+        self.has_live_ty(&TypeDef::Int(64))
+    }
+
+    /// Whether any instruction remaining in the blocks uses `double` (as result or operand).
+    pub fn has_live_double(&self) -> bool {
+        self.has_live_ty(&TypeDef::Double)
+    }
+
+    fn has_live_ty(&self, want: &TypeDef) -> bool {
+        for b in &self.blocks {
+            for &i in b.phis.iter().chain(&b.body) {
+                let inst = &self.insts[i as usize];
+                if &self.types[inst.ty.0 as usize] == want {
+                    return true;
+                }
+                let mut found = false;
+                for_each_operand(&inst.op, |v| {
+                    if &self.types[self.type_of(v).0 as usize] == want {
+                        found = true;
+                    }
+                });
+                if found {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Count of instructions (phis + body) currently retained across all blocks.
+    #[cfg(test)]
+    pub fn live_inst_count(&self) -> usize {
+        self.blocks.iter().map(|b| b.phis.len() + b.body.len()).sum()
+    }
+
     /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads
@@ -524,7 +1106,7 @@ impl Module {
         w.enter(MODULE_BLOCK, 3);
         w.record(1, &[1]); // VERSION: relative value ids
 
-        // Attribute groups 1-4 and one list per group.
+        // Attribute groups 1-4 and an optional f32 entry-point policy.
         w.enter(PARAMATTR_GROUP_BLOCK, 3);
         for (id, kinds) in [
             (1, &[18u64, 20][..]),
@@ -538,9 +1120,17 @@ impl Module {
             }
             w.record(3, &r);
         }
+        if let Some(mode) = self.f32_denorm_mode {
+            // LLVM 3.7 string attribute with key and value, both NUL-terminated.
+            let mut record = vec![5, 0xFFFF_FFFF, 4];
+            record.extend(chars("fp32-denorm-mode\0"));
+            record.extend(chars(mode));
+            record.push(0);
+            w.record(3, &record);
+        }
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=4 + u64::from(self.f32_denorm_mode.is_some()) {
             w.record(2, &[id]);
         }
         w.exit();
@@ -551,6 +1141,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -605,7 +1196,11 @@ impl Module {
         for f in &self.funcs {
             // [type, cc, isproto, linkage, paramattr, align, section,
             // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
-            let attr = f.attr.map_or(0, |a| a as u64);
+            let attr = if f.body && self.f32_denorm_mode.is_some() {
+                5
+            } else {
+                f.attr.map_or(0, |a| a as u64)
+            };
             w.record(
                 8,
                 &[
@@ -642,6 +1237,7 @@ impl Module {
                 Const::Undef => w.record(3, &[]),
                 Const::Int(v) => w.record(4, &[signed(*v)]),
                 Const::Float(bits) => w.record(6, &[u64::from(*bits)]),
+                Const::Double(bits) => w.record(6, &[*bits]),
                 Const::Aggregate(ids) => {
                     let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
                     w.record(7, &r);
@@ -657,26 +1253,7 @@ impl Module {
         // its forward predecessors (drivers take a branch to an earlier
         // block for a loop's back edge).
         let succs = |b: usize| successors(self.blocks[b].term);
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
+        let post = self.block_order();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
@@ -892,6 +1469,38 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
         Op::Gep(_, p, idx) => {
             f(*p);
             idx.iter().copied().for_each(f);
+        }
+    }
+}
+
+/// Rewrites every value operand of `op` with `f`.
+fn rewrite_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+    match op {
+        Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+            *a = f(*a);
+            *b = f(*b);
+        }
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => *v = f(*v),
+        Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+            *a = f(*a);
+            *b = f(*b);
+            *c = f(*c);
+        }
+        Op::Call(_, args) => {
+            for a in args {
+                *a = f(*a);
+            }
+        }
+        Op::Phi(inc) => {
+            for (v, _) in inc {
+                *v = f(*v);
+            }
+        }
+        Op::Gep(_, p, idx) => {
+            *p = f(*p);
+            for i in idx {
+                *i = f(*i);
+            }
         }
     }
 }
@@ -1183,6 +1792,54 @@ mod tests {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
+    }
+
+    #[test]
+    fn optimize_eliminates_redundant_bitcasts_identities_and_dead_pure_ops() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let f32t = m.float();
+        let main_ty = m.func_ty(void, vec![]);
+        m.ptr(main_ty);
+        m.function("main", main_ty, None, true);
+        let pure_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(pure_ty);
+        let pure_fn = m.function("dx.op.unary.i32", pure_ty, Some(Attr::ReadNone), false);
+        let sink_ty = m.func_ty(void, vec![i32t, f32t]);
+        m.ptr(sink_ty);
+        let sink_fn = m.function("dx.op.storeOutput.f32", sink_ty, Some(Attr::NoUnwind), false);
+
+        let entry = m.new_block();
+        let join = m.new_block();
+        let c1 = m.i32(0x3F80_0000);
+        let c0 = m.i32(0);
+        // Constant bitcast + round-trip bitcast
+        let f_const = m.cast(entry, Cast::Bitcast, c1, f32t);
+        let i_round = m.cast(entry, Cast::Bitcast, f_const, i32t);
+        // Identity + constant fold
+        let plus0 = m.bin(entry, Bin::Add, i_round, c0);
+        // Dead pure call whose declaration must also be pruned
+        let k1 = m.i32(1);
+        let _dead = m.call(entry, pure_fn, vec![k1, plus0]);
+        m.terminate(entry, Term::Br(join));
+
+        // Trivial phi
+        let p = m.phi(join, i32t);
+        m.set_phi(p, vec![(plus0, entry)]);
+        let pf = m.cast(join, Cast::Bitcast, p, f32t);
+        m.call(join, sink_fn, vec![p, pf]);
+        m.terminate(join, Term::Ret);
+
+        let before = m.live_inst_count();
+        m.optimize();
+        let after = m.live_inst_count();
+        assert!(after < before, "expected fewer instructions: {before} -> {after}");
+        assert_eq!(after, 1, "only the side-effecting sink call should remain");
+        assert!(
+            !m.funcs.iter().any(|f| f.name == "dx.op.unary.i32"),
+            "unused external dx.op declaration must be pruned"
+        );
     }
 
     #[test]

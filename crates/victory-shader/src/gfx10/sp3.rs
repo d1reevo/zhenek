@@ -362,9 +362,23 @@ fn hwreg(imm: u16) -> String {
     let (id, offset, size) = (imm & 0x3F, imm >> 6 & 0x1F, (imm >> 11 & 0x1F) + 1);
     let name = match id {
         1 => "HW_REG_MODE".into(),
+        2 => "HW_REG_STATUS".into(),
+        3 => "HW_REG_TRAPSTS".into(),
+        4 => "HW_REG_HW_ID1".into(),
+        5 => "HW_REG_GPR_ALLOC".into(),
+        6 => "HW_REG_LDS_ALLOC".into(),
+        7 => "HW_REG_IB_STS".into(),
+        15 => "HW_REG_SH_MEM_BASES".into(),
+        16 => "HW_REG_TBA_LO".into(),
+        17 => "HW_REG_TBA_HI".into(),
+        18 => "HW_REG_TMA_LO".into(),
+        19 => "HW_REG_TMA_HI".into(),
         20 => "HW_REG_SHADER_FLAT_SCRATCH_LO".into(),
         21 => "HW_REG_SHADER_FLAT_SCRATCH_HI".into(),
+        22 => "HW_REG_XNACK_MASK".into(),
+        23 => "HW_REG_HW_ID2".into(),
         25 => "HW_REG_POPS_PACKER".into(),
+        26 => "HW_REG_SHADER_CYCLES".into(),
         _ => id.to_string(),
     };
     if offset == 0 && size == 32 {
@@ -397,12 +411,19 @@ fn waitcnt(imm: u16) -> String {
 fn sendmsg(imm: u16) -> String {
     let (msg, op, stream) = (imm & 0xF, imm >> 4 & 7, imm >> 8 & 3);
     let msg_name = match msg {
+        1 => "MSG_INTERRUPT".into(),
         2 => "MSG_GS".into(),
         3 => "MSG_GS_DONE".into(),
         7 => "MSG_ORDERED_PS_DONE".into(),
         9 => "MSG_GS_ALLOC_REQ".into(),
+        10 => "MSG_GET_DOORBELL".into(),
+        11 => "MSG_GET_DDID".into(),
+        15 => "MSG_SYSMSG".into(),
         _ => msg.to_string(),
     };
+    if matches!(msg, 1 | 7 | 9 | 10 | 11) {
+        return format!("sendmsg({msg_name})");
+    }
     let op_name = ["GS_OP_NOP", "GS_OP_CUT", "GS_OP_EMIT", "GS_OP_EMIT_CUT"]
         .get(usize::from(op))
         .map_or(op.to_string(), |s| s.to_string());
@@ -522,8 +543,11 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
                     s = format!("-{s}");
                 }
             } else {
-                if bit(v.neg, i) && bit(v.neg_hi, i) {
-                    s = format!("-{s}");
+                match (bit(v.neg, i), bit(v.neg_hi, i)) {
+                    (true, true) => s = format!("-{s}"),
+                    (true, false) => s = format!("neg_lo({s})"),
+                    (false, true) => s = format!("neg_hi({s})"),
+                    (false, false) => {}
                 }
                 match (bit(v.opsel, i), bit(v.opsel_hi, i)) {
                     (false, true) => {}
@@ -780,5 +804,100 @@ mod tests {
         };
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
+    }
+
+    #[test]
+    fn fp16_packed_sdwa_dpp_and_scalar16() {
+        // VOP3P v_pk_add_f16 v2, neg_lo(v3), v4 with opsel_hi=[1,1], neg=[1,0], neg_hi=[0,0].
+        let pk_add = [0xCC0F_0002, 0x3802_0903];
+        assert_eq!(one(&pk_add, false), "v_pk_add_f16 v2, neg_lo(v3), v4");
+        // VOP3P v_dot8_i32_i4 v5, v1, v2, v3 (opsel_hi=[1,1,1] -> default).
+        let dot8 = [0xCC18_4005, 0x1C0E_0501];
+        assert_eq!(one(&dot8, false), "v_dot8_i32_i4 v5, v1, v2, v3");
+        // VOP2 v_pk_fmac_f16 v2, v3, v4.
+        let pk_fmac = [0x7804_0903];
+        assert_eq!(one(&pk_fmac, false), "v_pk_fmac_f16 v2, v3, v4");
+        // SDWA on 16-bit v_add_f16 v1, v2, v3 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:WORD_0.
+        let sdwa_f16 = [0x6402_06F9, 0x0405_1502];
+        assert_eq!(
+            one(&sdwa_f16, false),
+            "v_add_f16 v1, v2, v3 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:WORD_0"
+        );
+        // DPP16 on 16-bit v_add_f16 v1, v2, v3 row_shr:1 bound_ctrl:1.
+        let dpp_f16 = [0x6402_06FA, 0xFF09_1102];
+        assert_eq!(
+            one(&dpp_f16, false),
+            "v_add_f16 v1, v2, v3 row_shr:1 bound_ctrl:1"
+        );
+        // Scalar 16-bit packing & sign extension.
+        assert_eq!(
+            one(&[0x9902_0403], false),
+            "s_pack_ll_b32_b16 s2, s3, s4"
+        );
+        assert_eq!(
+            one(&[0x9982_0403], false),
+            "s_pack_lh_b32_b16 s2, s3, s4"
+        );
+        assert_eq!(
+            one(&[0x9A02_0403], false),
+            "s_pack_hh_b32_b16 s2, s3, s4"
+        );
+        assert_eq!(one(&[0xBE82_1A03], false), "s_sext_i32_i16 s2, s3");
+    }
+
+    #[test]
+    fn atomics_tbuffer_addtid_and_system_ops() {
+        // image_atomic_cmpswap v[4:5], v[0:1], s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_2D glc
+        let img_cmp = [0xF040_2308, 0x0002_0400];
+        assert_eq!(
+            one(&img_cmp, false),
+            "image_atomic_cmpswap v[4:5], v[0:1], s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_2D glc"
+        );
+        // global_atomic_add v6, v0, v2, s[4:5] glc
+        let glob_add = [0xDCC9_8000, 0x0604_0200];
+        assert_eq!(
+            one(&glob_add, false),
+            "global_atomic_add v6, v0, v2, s[4:5] glc"
+        );
+        // global_load_dword_addtid v3, off, s[4:5] inst_offset:16 (no VGPR addr)
+        let addtid = [0xDC58_8010, 0x0304_0007];
+        assert_eq!(
+            one(&addtid, false),
+            "global_load_dword_addtid v3, off, s[4:5] inst_offset:16"
+        );
+        // tbuffer_load_format_xyzw with standard (56) and non-standard (99) formats.
+        let tbuf_std = [0xE9C3_1000, 0x7D02_0401];
+        assert_eq!(
+            one(&tbuf_std, false),
+            "tbuffer_load_format_xyzw v[4:7], v1, s[8:11], null offen format:[BUF_FMT_8_8_8_8_UNORM]"
+        );
+        let tbuf_ext = [0xEB1B_1000, 0x7D02_0401];
+        assert_eq!(
+            one(&tbuf_ext, false),
+            "tbuffer_load_format_xyzw v[4:7], v1, s[8:11], null offen format:[99]"
+        );
+        // buffer_load_format_d16_xyzw packs 4 channels into 2 VGPRs.
+        let buf_d16 = [0xE20C_1000, 0x7D02_0401];
+        assert_eq!(
+            one(&buf_d16, false),
+            "buffer_load_format_d16_xyzw v[4:5], v1, s[8:11], null offen"
+        );
+        // SMEM atomic: s_buffer_atomic_add s4, s[8:11], 0x000010 glc
+        let smem_add = [0xF509_0104, 0xFA00_0010];
+        assert_eq!(
+            one(&smem_add, false),
+            "s_buffer_atomic_add s4, s[8:11], 0x000010 glc"
+        );
+        // System instructions: s_waitcnt_vscnt, s_sendmsg, s_getreg_b32.
+        assert_eq!(one(&[0xBBFD_0000], false), "s_waitcnt_vscnt null, 0x0000");
+        assert_eq!(one(&[0xBF90_0009], false), "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)");
+        assert_eq!(
+            one(&[0xBF90_0022], false),
+            "s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 0)"
+        );
+        assert_eq!(
+            one(&[0xB905_F804], false),
+            "s_getreg_b32 s5, hwreg(HW_REG_HW_ID1)"
+        );
     }
 }

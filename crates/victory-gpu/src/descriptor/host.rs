@@ -1234,6 +1234,29 @@ impl HostHeap {
         }
     }
 
+    /// Returns the current texture view only if this exact descriptor is
+    /// already backed by a resource. The clone pins that resource for refresh.
+    pub(crate) fn resident_texture_view(
+        &self,
+        index: u32,
+        handle: u64,
+    ) -> Option<(View, ID3D12Resource)> {
+        // SAFETY: the title heap supplies a valid descriptor slot.
+        let [tag, id, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG {
+            return None;
+        }
+        let key = u64::from(generation) << 32 | u64::from(id);
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if *made.get(index as usize)? != key {
+            return None;
+        }
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let resource = kept.get(index as usize)?.as_ref()?.clone();
+        let view = view_at(id, generation)?;
+        Some((view, resource))
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -1996,7 +2019,14 @@ fn keep_views() -> bool {
 fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
-            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
+            resource[0] != 1
+                && resource == other
+                && desc[10..12] == other_desc[10..12]
+                // This exception is for mip streaming only. A swizzle,
+                // slice or format change must reach the host descriptor.
+                && desc[..3] == other_desc[..3]
+                && desc[6..10] == other_desc[6..10]
+                && matches!(desc[1], 2..=5 | 8..=10)
         }
         _ => false,
     }
@@ -2222,6 +2252,9 @@ mod tests {
         let low = view(texture, 3, 0x1000_0000);
         // more mips of the same texture
         assert!(same_placed_texture(&low, &view(texture, 0, 0x1000_0000)));
+        let View::Placed(_, resource, mut swizzled) = low.clone() else { unreachable!() };
+        swizzled[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING ^ 2;
+        assert!(!same_placed_texture(&low, &View::Placed(false, resource, swizzled)));
         // another address, another description, a buffer, an unordered view
         assert!(!same_placed_texture(&low, &view(texture, 3, 0x2000_0000)));
         let mut wider = texture;

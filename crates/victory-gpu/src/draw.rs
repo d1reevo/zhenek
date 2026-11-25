@@ -15,10 +15,10 @@ use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
@@ -158,6 +158,7 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    material_color: usize,
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
@@ -511,8 +512,9 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        self.material_color = 0;
         let mut rtvs = Vec::new();
-        for &h in handles {
+        for (slot, &h) in handles.iter().enumerate() {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -536,6 +538,9 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            if slot == 0 {
+                self.material_color = record.resource as usize;
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
@@ -836,6 +841,9 @@ impl State {
                 DEPTH_WRITE
             };
             crate::list::ensure_state(list, self.depth as This, state);
+            if self.targets.len() >= 2 {
+                crate::relight::note_material(self.material_color, self.depth);
+            }
         }
         true
     }
@@ -1551,16 +1559,21 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
-            // From here on a host texture is made: not without room. The
-            // slot stays due.
-            if !room {
+            let Some(handle) = heap.handle(index) else { continue };
+            // A full budget still allows refreshing a resident texture.
+            // A changed or missing view stays due without making a GPU copy.
+            let (view, _resident) = if room {
+                (host.mirror(index, handle, true), None)
+            } else if let Some((view, resource)) = host.resident_texture_view(index, handle) {
+                once!("refreshing resident textures with the video-memory budget full");
+                (Some(view), Some(resource))
+            } else {
                 refused += 1;
-                if refused > 256 {
+                if refused > 1024 {
                     break;
                 }
                 continue;
-            }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1676,6 +1689,7 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::record_drop_detail("dispatch", self.pipeline as This, "");
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -1689,6 +1703,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::record_drop_detail("dispatch", self.pipeline as This, "");
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -1702,6 +1717,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::record_drop_detail("dispatch-bind", self.pipeline as This, "");
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -1726,6 +1742,9 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return kind;
         };
+        if !crate::host::dred_on() && crate::host::timing() && crate::capture::folder().is_none() {
+            return format!("{kind} {}", p.name);
+        }
         let mut text = format!("{kind} {}", p.name);
         // What it draws into (a dispatch writes through its views below).
         if !compute {
@@ -1796,6 +1815,36 @@ impl State {
         }
     }
 
+    /// Compact summary of currently bound render/depth targets (called only on dropped draws).
+    fn target_tag(&self) -> String {
+        use std::fmt::Write;
+        let describe = |r: usize| -> Option<String> {
+            if r == 0 {
+                return None;
+            }
+            let copy = crate::resource::host_copy(r as This)?;
+            // SAFETY: a live host resource.
+            let d = unsafe { copy.texture.GetDesc() };
+            Some(format!("{}x{}f{}", d.Width, d.Height, d.Format.0))
+        };
+        let mut out = String::new();
+        for (i, &t) in self.targets.iter().take(4).enumerate() {
+            if let Some(tag) = describe(t) {
+                if !out.is_empty() {
+                    out.push(',');
+                }
+                let _ = write!(out, "rt{i}:{tag}");
+            }
+        }
+        if let Some(tag) = describe(self.depth) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            let _ = write!(out, "ds:{tag}");
+        }
+        out
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
@@ -1805,8 +1854,8 @@ impl State {
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
+            && match list.mesh_list() {
+                Some(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
@@ -1816,10 +1865,12 @@ impl State {
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                Err(_) => false,
+                None => false,
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            let targets = self.target_tag();
+            crate::pipeline::record_drop_detail("mesh", self.pipeline as This, &targets);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2148,6 +2199,8 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            let targets = self.target_tag();
+            crate::pipeline::record_drop_detail("draw", self.pipeline as This, &targets);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2249,6 +2302,8 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            let targets = self.target_tag();
+            crate::pipeline::record_drop_detail("draw", self.pipeline as This, &targets);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2276,17 +2331,27 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::pipeline::record_drop_detail("indirect-bvh", self.pipeline as This, "");
             return false;
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        let indirect_tag = match kind {
+            DRAW => "indirect-draw",
+            INDEXED => "indirect-indexed",
+            MESH => "indirect-mesh",
+            DISPATCH => "indirect-dispatch",
+            _ => "indirect-other",
+        };
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            let targets = if kind == DISPATCH { String::new() } else { self.target_tag() };
+            crate::pipeline::record_drop_detail(indirect_tag, self.pipeline as This, &targets);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;

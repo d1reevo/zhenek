@@ -72,6 +72,7 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -437,6 +438,30 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        self.m.optimize();
+        self.m.prune_unused_globals();
+        let (views, samplers) = self.m.heap_usage();
+        if !views {
+            self.flags &= !flags::RESOURCE_HEAP;
+        }
+        if !samplers {
+            self.flags &= !flags::SAMPLER_HEAP;
+        }
+        if !self.m.uses_waves() {
+            self.flags &= !flags::WAVE_OPS;
+        }
+        // DXC gates implicit compute derivatives on validator 1.8,
+        // even though the shader model and IR version are both 6.6/1.6.
+        let val18 = self.threads.is_some() && self.mesh.is_none() && self.m.uses_implicit_sampling();
+        if self.flags & flags::DOUBLES != 0 && !self.m.has_live_double() {
+            self.flags &= !flags::DOUBLES;
+        }
+        if self.flags & flags::INT64 != 0
+            && self.flags & (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64) == 0
+            && !self.m.has_live_int64()
+        {
+            self.flags &= !flags::INT64;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -722,7 +747,13 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let validator = if val18 {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![validator]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -747,6 +778,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::DOUBLES != 0 {
+            features |= 0x1;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -784,6 +818,7 @@ impl Shader {
         };
         let psv0 = container::psv(&Psv {
             stage: kind as u8,
+            entry_name: val18.then_some("main"),
             flag: flag && self.threads.is_none(),
             inputs: &self.inputs,
             outputs: &self.outputs,

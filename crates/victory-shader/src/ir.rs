@@ -180,9 +180,13 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         // codes may be ones the machine word cannot hold.
         if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
             && let Fields::Sop { dst: Some(Operand::Scalar { code: to, .. }), src, .. } = &mut fields
-            && let Some(Operand::Scalar { code: from, .. }) = src.first_mut()
         {
-            (*to, *from) = (parked[k].1, parked[k].2);
+            *to = parked[k].1;
+            if let (Some(from_code), Some(Operand::Scalar { code: from, .. })) =
+                (parked[k].2, src.first_mut())
+            {
+                *from = from_code;
+            }
         }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
         let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
@@ -252,23 +256,41 @@ fn unspill(
     wave64: bool,
     lanes: u8,
     vgprs: u16,
-) -> Vec<(usize, u8, u8)> {
-    /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
-    fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, u8, u32)> {
+) -> Vec<(usize, u8, Option<u8>)> {
+    /// What a `v_writelane_b32` writes into a parked VGPR lane: an SGPR, an
+    /// inline constant code, or a 32-bit literal.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ParkedVal {
+        Scalar(u8),
+        Const(u8),
+        Literal(u32),
+    }
+
+    /// `v_writelane_b32 vN, src, K` / `v_readlane_b32 sX, vN, K`: (save, N, val, K).
+    fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, ParkedVal, u32)> {
         let Fields::Valu(v) = fields else { return None };
         if v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return None;
         }
         let lane = |op: &Operand| match *op {
             Operand::Const(c @ 128..=191) => Some(u32::from(c) - 128),
+            Operand::Literal(k) if k < 64 => Some(k),
             _ => None,
         };
         match (inst.name()?, v.dst?, v.src.as_slice()) {
-            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k]) if *code < 105 => {
-                Some((true, reg, *code, lane(k)?))
+            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k]) if *code <= 105 => {
+                Some((true, reg, ParkedVal::Scalar(*code), lane(k)?))
             }
-            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k]) if code < 105 => {
-                Some((false, *reg, code, lane(k)?))
+            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Const(c), k])
+                if crate::resource::inline(*c).is_some() =>
+            {
+                Some((true, reg, ParkedVal::Const(*c), lane(k)?))
+            }
+            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Literal(lit), k]) => {
+                Some((true, reg, ParkedVal::Literal(*lit), lane(k)?))
+            }
+            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k]) if code <= 105 => {
+                Some((false, *reg, ParkedVal::Scalar(code), lane(k)?))
             }
             _ => None,
         }
@@ -278,8 +300,9 @@ fn unspill(
     let mut stores = [false; 256];
     let mut other = [false; 256];
     let mut used = [false; 128];
-    let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
+    let mut parks: Vec<Option<(bool, u8, ParkedVal, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
+    let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     for inst in list.iter() {
         let Some(name) = inst.name() else { return Vec::new() };
         let fields = inst.fields(wave64);
@@ -288,13 +311,28 @@ fn unspill(
             return Vec::new();
         };
         let mut codes = Vec::new();
+        let mut from = Vec::new();
         if let Some((reads, writes)) = effects {
             for &reg in &writes {
                 if let Reg::S(c) = reg {
                     codes.push(c);
                 }
             }
-            for reg in reads.into_iter().chain(writes) {
+            for &reg in &reads {
+                if let Reg::S(c) = reg {
+                    from.push(c);
+                }
+            }
+            // An M0-relative read (`v_movrels_b32`) names every VGPR from its
+            // base up; the compiler indexes a small array with it, never the
+            // lanes it parks scalars in, so it does not make those VGPRs
+            // ordinary ones. (Relative writes still do.)
+            let relative = name == "v_movrels_b32";
+            let n_reads = reads.len();
+            for (k, reg) in reads.into_iter().chain(writes).enumerate() {
+                if relative && k < n_reads && matches!(reg, Reg::V(_)) {
+                    continue;
+                }
                 match reg {
                     Reg::S(c) => used[usize::from(c)] = true,
                     Reg::V(r) if park.is_some_and(|p| p.1 == r) => stores[usize::from(r)] = true,
@@ -305,6 +343,7 @@ fn unspill(
         }
         parks.push(park);
         written.push(codes);
+        read.push(from);
     }
     for (i, park) in parks.iter_mut().enumerate() {
         if park.is_some_and(|p| other[usize::from(p.1)]) {
@@ -330,11 +369,13 @@ fn unspill(
     slots.dedup();
     // instruction -> the instruction that completes its pair
     let partner = |i: usize| -> Option<usize> {
-        let (save, reg, code, lane) = parks[i]?;
+        let (save, reg, ParkedVal::Scalar(code), lane) = parks[i]? else {
+            return None;
+        };
         if save {
             let mut j = i + 1;
             while j < list.len() && !leader(j) {
-                if parks[j] == Some((true, reg, code + 1, lane + 1)) {
+                if parks[j] == Some((true, reg, ParkedVal::Scalar(code + 1), lane + 1)) {
                     return Some(j);
                 }
                 if parks[j].is_some_and(|p| p.1 == reg && (p.3 == lane || p.3 == lane + 1))
@@ -347,8 +388,25 @@ fn unspill(
             }
             None
         } else {
-            let j = i + 1;
-            (j < list.len() && !leader(j) && parks[j] == Some((false, reg, code + 1, lane + 1))).then_some(j)
+            // The second restore may come a few instructions later (the
+            // compiler schedules other work between the two): the pair is
+            // restored at the first, so nothing between may read or write
+            // the second register, write the first, or save into the lanes.
+            let mut j = i + 1;
+            while j < list.len() && !leader(j) {
+                if parks[j] == Some((false, reg, ParkedVal::Scalar(code + 1), lane + 1)) {
+                    return Some(j);
+                }
+                if parks[j].is_some_and(|p| p.0 && p.1 == reg && (p.3 == lane || p.3 == lane + 1))
+                    || written[j].contains(&code)
+                    || written[j].contains(&(code + 1))
+                    || read[j].contains(&(code + 1))
+                {
+                    return None;
+                }
+                j += 1;
+            }
+            None
         }
     };
     let mut pairs: Vec<(u8, u32)> = Vec::new();
@@ -373,13 +431,13 @@ fn unspill(
     // scalars and leaves about 20 machine codes unused.
     let past = usize::from(PARKED);
     let mut free = [false; 256];
-    for c in (0..105).chain(108..=123) {
+    for c in (0..=105).chain(108..=123) {
         free[c] = !used[c];
     }
     free[past..255].fill(true);
     let mut codes: Vec<((u8, u32), u8)> = Vec::new();
     for &(reg, lane) in &pairs {
-        let at = (108..123).chain((0..104).rev()).chain(past..254).find(|&c| free[c] && free[c + 1]);
+        let at = (108..123).chain((0..105).rev()).chain(past..254).find(|&c| free[c] && free[c + 1]);
         // Not enough spare codes: leave the program as it is.
         let Some(c) = at else { return Vec::new() };
         (free[c], free[c + 1]) = (false, false);
@@ -390,19 +448,19 @@ fn unspill(
         if codes.iter().any(|c| c.0 == slot) {
             continue;
         }
-        let Some(c) = (108..=123).chain((0..105).rev()).chain(past..255).find(|&c| free[c]) else {
+        let Some(c) = (108..=123).chain((0..=105).rev()).chain(past..255).find(|&c| free[c]) else {
             return Vec::new();
         };
         free[c] = false;
         codes.push((slot, c as u8));
     }
     let code_of = |reg: u8, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
-    let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, word: u32| {
+    let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, words: Vec<u32>| {
         list[i] = gfx10::Instruction {
             offset: list[i].offset,
             encoding,
             opcode,
-            words: vec![word],
+            words,
         };
     };
     // `s_mov_b32` / `s_mov_b64 dst, src` (SOP1, opcodes 3 and 4); `s_nop`. A code
@@ -410,35 +468,57 @@ fn unspill(
     let field = |code: u8| if code < PARKED { u32::from(code) } else { 0 };
     let mov = |wide: bool, dst: u8, src: u8| 0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src);
     const NOP: u32 = 0xBF80_0000;
-    let mut edits: Vec<(usize, Option<(bool, u8, u8)>)> = Vec::new();
+    enum Edit {
+        Nop,
+        Reg { wide: bool, dst: u8, src: u8 },
+        Const { dst: u8, code: u8 },
+        Lit { dst: u8, lit: u32 },
+    }
+    let mut edits: Vec<(usize, Edit)> = Vec::new();
     for i in 0..list.len() {
-        let Some((save, reg, code, lane)) = parks[i] else {
+        let Some((save, reg, val, lane)) = parks[i] else {
             continue;
         };
         let Some(slot) = code_of(reg, lane) else { return Vec::new() };
         if pairs.contains(&(reg, lane)) {
+            let ParkedVal::Scalar(code) = val else { return Vec::new() };
             let Some(j) = partner(i) else { return Vec::new() };
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
             let (at, gone) = if save { (j, i) } else { (i, j) };
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
-            edits.push((at, Some((true, dst, src))));
-            edits.push((gone, None));
+            edits.push((at, Edit::Reg { wide: true, dst, src }));
+            edits.push((gone, Edit::Nop));
         } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
             // the upper half of a pair: moved with the lower
         } else {
-            let (dst, src) = if save { (slot, code) } else { (code, slot) };
-            edits.push((i, Some((false, dst, src))));
+            match (save, val) {
+                (true, ParkedVal::Scalar(code)) => edits.push((i, Edit::Reg { wide: false, dst: slot, src: code })),
+                (false, ParkedVal::Scalar(code)) => edits.push((i, Edit::Reg { wide: false, dst: code, src: slot })),
+                (true, ParkedVal::Const(c)) => edits.push((i, Edit::Const { dst: slot, code: c })),
+                (true, ParkedVal::Literal(lit)) => edits.push((i, Edit::Lit { dst: slot, lit })),
+                (false, _) => return Vec::new(),
+            }
         }
     }
     let mut moves = Vec::new();
     for (i, edit) in edits {
         match edit {
-            Some((wide, dst, src)) => {
-                put(list, i, gfx10::Encoding::Sop1, 3 + u16::from(wide), mov(wide, dst, src));
-                moves.push((i, dst, src));
+            Edit::Reg { wide, dst, src } => {
+                put(list, i, gfx10::Encoding::Sop1, 3 + u16::from(wide), vec![mov(wide, dst, src)]);
+                moves.push((i, dst, Some(src)));
             }
-            None => put(list, i, gfx10::Encoding::Sopp, 0, NOP),
+            Edit::Const { dst, code } => {
+                let word = 0xBE80_0300 | field(dst) << 16 | u32::from(code);
+                put(list, i, gfx10::Encoding::Sop1, 3, vec![word]);
+                moves.push((i, dst, None));
+            }
+            Edit::Lit { dst, lit } => {
+                let word = 0xBE80_03FF | field(dst) << 16;
+                put(list, i, gfx10::Encoding::Sop1, 3, vec![word, lit]);
+                moves.push((i, dst, None));
+            }
+            Edit::Nop => put(list, i, gfx10::Encoding::Sopp, 0, vec![NOP]),
         }
     }
     moves.sort_unstable();
@@ -1159,12 +1239,17 @@ fn effects(
             data,
             base,
             soffset,
+            cache,
             ..
         } => match name {
             "s_memtime" | "s_memrealtime" | "s_get_waveid_in_workgroup" => {
                 regs(data.as_ref().ok_or_else(unsupported)?, &mut w)?;
             }
             "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => {}
+            _ if name.starts_with("s_dcache_discard") || name.starts_with("s_atc_probe") => {
+                regs(base, &mut r)?;
+                regs(soffset, &mut r)?;
+            }
             _ if name.contains("_load_") || name.contains("_store_") => {
                 regs(base, &mut r)?;
                 regs(soffset, &mut r)?;
@@ -1177,6 +1262,15 @@ fn effects(
                         &mut r
                     },
                 )?;
+            }
+            _ if name.contains("_atomic_") => {
+                regs(base, &mut r)?;
+                regs(soffset, &mut r)?;
+                let data = data.as_ref().ok_or_else(unsupported)?;
+                regs(data, &mut r)?;
+                if cache.glc {
+                    regs(&atomic_result(data, name), &mut w)?;
+                }
             }
             _ => return Err(unsupported()),
         },
@@ -1409,6 +1503,10 @@ fn atomic_result(data: &Operand, name: &str) -> Operand {
             reg,
             dwords: dwords / 2,
         },
+        Operand::Scalar { code, dwords } if name.contains("cmpswap") => Operand::Scalar {
+            code,
+            dwords: dwords / 2,
+        },
         op => op,
     }
 }
@@ -1638,5 +1736,133 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn smem_atomics_discard_and_global_addtid_effects() {
+        let p = build_words(
+            &[
+                // s_buffer_atomic_cmpswap s[4:5], s[8:11], 0x10 glc -> reads s[4:5], s[8:11]; writes s4
+                0xF505_0104,
+                0xFA00_0010,
+                // s_dcache_discard s[2:3], 0x0 -> reads s[2:3], writes nothing
+                0xF4A0_0001,
+                0xFA00_0000,
+                // global_load_dword_addtid v3, off, s[6:7] -> writes v3, does NOT read v7 in addr bits
+                0xDC58_8000,
+                0x0306_0007,
+                // s_waitcnt_vscnt null, 0 -> dropped
+                0xBBFD_0000,
+                // s_waitcnt_depctr 0 -> dropped
+                0xBFA3_0000,
+                // s_getreg_b32 s12, hwreg(HW_REG_HW_ID1) -> writes s12
+                0xB90C_F804,
+                // s_sendmsg sendmsg(MSG_GS_ALLOC_REQ) -> reads M0
+                0xBF90_0009,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [satom, discard, addtid, getreg, sendmsg, _] = &p.blocks[0].insts[..] else {
+            panic!("{:?}", p.blocks[0].insts)
+        };
+        assert_eq!(satom.name(), "s_buffer_atomic_cmpswap");
+        assert!(satom.read(Reg::S(4)).is_some() && satom.read(Reg::S(5)).is_some());
+        assert!(satom.read(Reg::S(8)).is_some() && satom.read(Reg::S(11)).is_some());
+        assert!(satom.write(Reg::S(4)).is_some() && satom.write(Reg::S(5)).is_none());
+
+        assert_eq!(discard.name(), "s_dcache_discard");
+        assert!(discard.read(Reg::S(2)).is_some() && discard.read(Reg::S(3)).is_some());
+        assert!(discard.writes.is_empty());
+
+        assert_eq!(addtid.name(), "global_load_dword_addtid");
+        assert!(addtid.read(Reg::S(6)).is_some() && addtid.read(Reg::S(7)).is_some());
+        assert!(addtid.read(Reg::V(7)).is_none(), "addtid must not read vaddr");
+        assert!(addtid.write(Reg::V(3)).is_some());
+
+        assert_eq!(getreg.name(), "s_getreg_b32");
+        assert!(getreg.write(Reg::S(12)).is_some());
+        assert!(getreg.reads.is_empty());
+
+        assert_eq!(sendmsg.name(), "s_sendmsg");
+        assert!(sendmsg.read(Reg::S(M0)).is_some());
+    }
+
+    #[test]
+    fn image_global_and_d16_format_buffer_ir_effects() {
+        let p = build_words(
+            &[
+                // image_atomic_cmpswap v[4:5], v[0:1], s[8:15] dmask:0x3 dim:2D glc
+                0xF040_2308,
+                0x0002_0400,
+                // global_atomic_cmpswap v6, v0, v[2:3], s[4:5] glc
+                0xDCC5_8000,
+                0x0604_0200,
+                // buffer_load_format_d16_xyzw v[10:11], v1, s[16:19], null offen
+                0xE20C_1000,
+                0x7D04_0A01,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [img, glob, buf, _] = &p.blocks[0].insts[..] else {
+            panic!("{:?}", p.blocks[0].insts)
+        };
+        assert_eq!(img.name(), "image_atomic_cmpswap");
+        assert!(img.read(Reg::V(4)).is_some() && img.read(Reg::V(5)).is_some());
+        assert!(img.write(Reg::V(4)).is_some() && img.write(Reg::V(5)).is_none());
+
+        assert_eq!(glob.name(), "global_atomic_cmpswap");
+        assert!(glob.read(Reg::V(2)).is_some() && glob.read(Reg::V(3)).is_some());
+        assert!(glob.write(Reg::V(6)).is_some() && glob.write(Reg::V(7)).is_none());
+
+        assert_eq!(buf.name(), "buffer_load_format_d16_xyzw");
+        assert!(buf.write(Reg::V(10)).is_some() && buf.write(Reg::V(11)).is_some());
+        assert!(buf.write(Reg::V(12)).is_none());
+    }
+
+    #[test]
+    fn unspills_scheduled_wave64_pair_across_movrels() {
+        // Save s[2:3] into v5 lanes 0,1; run v_movrels_b32 v0, v1 (which spans
+        // up to vgprs=6 including v5); restore s2, interleave unrelated s_mov,
+        // then restore s3 -> unspill must keep the pair as s_mov_b64!
+        let p = build(&[
+            0xD761_0005u32, 0x0001_0002, // v_writelane_b32 v5, s2, 0
+            0xD761_0005,    0x0001_0203, // v_writelane_b32 v5, s3, 1
+            0x7E00_8701,                 // v_movrels_b32 v0, v1
+            0xD760_0002,    0x0001_0105, // v_readlane_b32 s2, v5, 0
+            0xBE88_0380,                 // s_mov_b32 s8, 0 (unrelated)
+            0xD760_0003,    0x0001_0305, // v_readlane_b32 s3, v5, 1
+            S_ENDPGM,
+        ].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>(), true, 6).unwrap();
+        let names: Vec<_> = p.blocks[0].insts.iter().map(Inst::name).collect();
+        assert!(
+            names.iter().filter(|&&n| n == "s_mov_b64").count() == 2,
+            "expected pair save & restore as s_mov_b64, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn unspills_inline_const_and_s105_lane_spills() {
+        // v_writelane_b32 v5, 0, 0      (const 0 = 0x80 -> lane 0)
+        // v_writelane_b32 v5, s105, 1   (s105 = 0x69 -> lane 1)
+        // v_readlane_b32 s4, v5, 0
+        // v_readlane_b32 s5, v5, 1
+        // s_endpgm
+        let p = build_words(
+            &[
+                0xD761_0005, 0x0001_0080, // v_writelane_b32 v5, 0, 0
+                0xD761_0005, 0x0001_0269, // v_writelane_b32 v5, s105, 1
+                0xD760_0004, 0x0001_0105, // v_readlane_b32 s4, v5, 0
+                0xD760_0005, 0x0001_0305, // v_readlane_b32 s5, v5, 1
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let names: Vec<_> = p.blocks[0].insts.iter().map(Inst::name).collect();
+        assert_eq!(
+            names,
+            ["s_mov_b32", "s_mov_b32", "s_mov_b32", "s_mov_b32", "s_endpgm"]
+        );
     }
 }

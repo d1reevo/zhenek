@@ -232,6 +232,23 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// Override the DXIL entry point's f32 arithmetic denormal policy for
+/// diagnostics. The container does not currently supply the console MODE.
+pub fn f32_denorm_mode() -> Option<&'static str> {
+    static MODE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_SHADER_F32_DENORMS").as_deref() {
+        Ok("preserve") => Some("preserve"),
+        Ok("ftz") => Some("ftz"),
+        _ => None,
+    })
+}
+
+/// Refuse mesh shaders whose output footprint still exceeds 32 KiB
+/// after reducing the static maxima to the reachable lanes.
+pub fn mesh_output_strict() -> bool {
+    std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some()
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -770,15 +787,20 @@ mod tests {
         for body in [&select[..], &carry, &mov] {
             stores_v1(body).unwrap();
         }
-        // s_mov_b32 vcc_hi, 0 after the compare.
+        // s_mov_b32 vcc_hi, 0 after the compare: low dword is split across two
+        // highs, so selects/carries refuse instead of taking the old compare.
         let select_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x0202_0480];
         let carry_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x5002_0480];
-        // s_mov_b32 exec_hi, 0; v_mov_b32 v1, 7, then the same after
-        // s_mov_b64 s[2:3], exec.
+        for body in [&select_hi[..], &carry_hi] {
+            assert!(stores_v1(body).is_err(), "{body:x?}");
+        }
+        // s_mov_b32 exec_hi, 0; v_mov_b32 v1, 7 (with or without saving exec):
+        // structure.rs models half-EXEC writes as Atom::Constant(0xFFFF_FFFF)
+        // so lanes 32-63 are properly masked off and compute lowering succeeds.
         let exec_hi = [0xBEFF_0380, 0x7E02_0287];
         let exec_hi_saved = [0xBE82_047E, 0xBEFF_0380, 0x7E02_0287];
-        for body in [&select_hi[..], &carry_hi, &exec_hi, &exec_hi_saved] {
-            assert!(stores_v1(body).is_err(), "{body:x?}");
+        for body in [&exec_hi[..], &exec_hi_saved] {
+            stores_v1(body).unwrap();
         }
     }
 
@@ -1291,6 +1313,162 @@ mod atomic_tests {
                 v.validate(&mut shader.dxil.clone()).unwrap();
             }
         }
+    }
+
+    /// 64-bit `image_atomic_add` on an `R32G32_UINT` Texture2D UAV in
+    /// `ResourceDescriptorHeap[]` validates and executes on the host GPU (RTX 5060 SM 6.6+).
+    #[cfg(windows)]
+    #[test]
+    fn heap_texture_atomic_64bit_executes_on_gpu() {
+        // Each of 32 threads adds (0x1_0000_0001u64) to texel (0, 0) of an R32G32_UINT UAV.
+        // Expected final value at texel (0, 0): lo = 32, hi = 32.
+        let words: [u32; 14] = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0200,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+            0x7E00_0280, // v_mov_b32 v0, 0 (x)
+            0x7E02_0280, // v_mov_b32 v1, 0 (y)
+            0x7E04_0281, // v_mov_b32 v2, 1 (lo)
+            0x7E06_0281, // v_mov_b32 v3, 1 (hi)
+            // image_atomic_add v[2:3], v[0:1], s[8:15] dmask:0x3 dim:2D glc
+            0xF044_2308,
+            0x0002_0200,
+            // buffer/tex wait + end
+            0xBF8C_3F70,
+            0xBF81_0000,
+            0xBF81_0000,
+            0xBF81_0000,
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2,
+                threads: [32, 1, 1],
+            }),
+            code: words[..11].iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let mut shader = emit(
+            &Container::parse(&bytes).unwrap(),
+            &native,
+            &p,
+            &structure::structure(&p).unwrap(),
+            &io::raise(&p, &native).unwrap(),
+            &resource::track(&p, &native.layout, native.stage, None).unwrap(),
+        )
+        .unwrap();
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil).unwrap();
+        }
+        let Ok(host) = host::Host::new(false) else {
+            return;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &host::Dispatch {
+                    roots: vec![(0, host::Root::Constants(vec![0]))],
+                    views: &[host::View::Uint64TextureUav(1, 1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(out[0], [32, 32], "64-bit R32G32_UINT atomic add across 32 lanes");
+    }
+
+    /// 64-bit `buffer_atomic_add_x2` on a raw buffer UAV in `ResourceDescriptorHeap[]`
+    /// validates and executes on the host GPU (RTX 5060 SM 6.6+).
+    #[cfg(windows)]
+    #[test]
+    fn heap_buffer_atomic_64bit_executes_on_gpu() {
+        // Each of 32 threads adds (0x2_0000_0003u64) at byte 0 of a RawUav via
+        // `buffer_atomic_add_x2 v[2:3], v0, s[8:11], 0 offen glc`.
+        // Expected final qword: lo = 96, hi = 64.
+        let words: [u32; 10] = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0
+            0x7E00_0280, // v_mov_b32 v0, 0 (byte offset)
+            0x7E04_0283, // v_mov_b32 v2, 3 (lo)
+            0x7E06_0282, // v_mov_b32 v3, 2 (hi)
+            // MUBUF op=0x52 (buffer_atomic_add_x2), offen=1 (bit 12), glc=1 (bit 14):
+            // w0 = 0xE000_0000 | (0x52 << 18) | (1 << 14) | (1 << 12) = 0xE148_5000
+            // w1 = (0x80 << 24) | (2 << 16) | (2 << 8) | 0 = 0x8002_0200 (soffset=0, srsrc=s[8:11], vdata=v2, vaddr=v0)
+            0xE148_5000,
+            0x8002_0200,
+            0xBF8C_3F70,
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let mut shader = emit(
+            &Container::parse(&bytes).unwrap(),
+            &native,
+            &p,
+            &structure::structure(&p).unwrap(),
+            &io::raise(&p, &native).unwrap(),
+            &resource::track(&p, &native.layout, native.stage, None).unwrap(),
+        )
+        .unwrap();
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil).unwrap();
+        }
+        let Ok(host) = host::Host::new(false) else {
+            return;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &host::Dispatch {
+                    roots: vec![(0, host::Root::Constants(vec![0]))],
+                    views: &[host::View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(out[0], [96, 64], "64-bit raw buffer atomic add_x2 across 32 lanes");
     }
 }
 

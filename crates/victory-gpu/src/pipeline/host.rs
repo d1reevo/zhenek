@@ -556,10 +556,59 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let mut made = mesh_pipeline(&host.device, &root, code(0), code(1), g, &name);
+            if made.is_err()
+                && let Some(fixed_blend) = sanitize_integer_rt_blend(g)
+            {
+                let mut fixed = GraphicsState {
+                    blend: fixed_blend,
+                    sample_mask: g.sample_mask,
+                    rasterizer: g.rasterizer,
+                    depth: g.depth,
+                    inputs: Vec::new(),
+                    names: Vec::new(),
+                    strip_cut: g.strip_cut,
+                    topology: g.topology,
+                    targets: g.targets,
+                    depth_format: g.depth_format,
+                    samples: g.samples,
+                };
+                let fixed_name = super::library::name(
+                    "mesh triangles int-rt-noblend",
+                    &root_blob,
+                    &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                    &fixed.describe(),
+                );
+                made = mesh_pipeline(&host.device, &root, code(0), code(1), &fixed, &fixed_name);
+                if made.is_ok() {
+                    tracing::warn!(
+                        ?shaders,
+                        targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
+                        indep_blend = g.blend.IndependentBlendEnable.as_bool(),
+                        "host mesh pipeline recovered by disabling blend on integer render targets"
+                    );
+                }
+                fixed.inputs.clear();
+            }
+            let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    for s in shaders {
+                        s.save_failed_container();
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
+                        dsv = g.depth_format.0,
+                        samples = ?g.samples,
+                        indep_blend = g.blend.IndependentBlendEnable.as_bool(),
+                        rt0_blend = ?g.blend.RenderTarget[0],
+                        raster = ?g.rasterizer,
+                        depth = ?g.depth,
+                        topology = g.topology.0,
+                        "host mesh pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }
@@ -659,10 +708,46 @@ impl HostPipeline {
             rect_gs = None;
             made = make(&desc, &name(None));
         }
+        if made.is_err()
+            && let Some(fixed_blend) = sanitize_integer_rt_blend(g)
+        {
+            desc.BlendState = fixed_blend;
+            let fixed_name = super::library::name(
+                "graphics int-rt-noblend",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &state,
+            );
+            let retried = make(&desc, &fixed_name);
+            if retried.is_ok() {
+                tracing::warn!(
+                    ?shaders,
+                    targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
+                    indep_blend = g.blend.IndependentBlendEnable.as_bool(),
+                    "host graphics pipeline recovered by disabling blend on integer render targets"
+                );
+                made = retried;
+            }
+        }
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                for s in shaders {
+                    s.save_failed_container();
+                }
+                tracing::warn!(
+                    error = %e,
+                    ?shaders,
+                    targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
+                    dsv = g.depth_format.0,
+                    samples = ?g.samples,
+                    indep_blend = g.blend.IndependentBlendEnable.as_bool(),
+                    rt0_blend = ?g.blend.RenderTarget[0],
+                    raster = ?g.rasterizer,
+                    depth = ?g.depth,
+                    topology = g.topology.0,
+                    "host pipeline refused"
+                );
                 host.log_messages();
                 return None;
             }
@@ -784,6 +869,72 @@ fn mesh_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// Integer render-target formats that D3D12 forbids blending on (`E_INVALIDARG`).
+fn is_integer_rt_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// Disables blending only on integer render targets (matching console hardware,
+/// which ignores blend on integer targets even when `IndependentBlendEnable` is
+/// false and RT0 has blending enabled). Returns `None` if nothing changed.
+fn sanitize_integer_rt_blend(g: &GraphicsState) -> Option<D3D12_BLEND_DESC> {
+    let n = (g.targets.NumRenderTargets as usize).min(8);
+    if n == 0 {
+        return None;
+    }
+    let mut blend = g.blend;
+    let indep = blend.IndependentBlendEnable.as_bool();
+    let mut changed = false;
+    if !indep {
+        if blend.RenderTarget[0].BlendEnable.as_bool()
+            && (0..n).any(|i| is_integer_rt_format(g.targets.RTFormats[i]))
+        {
+            blend.IndependentBlendEnable = true.into();
+            let rt0 = blend.RenderTarget[0];
+            for slot in &mut blend.RenderTarget[1..n] {
+                *slot = rt0;
+            }
+            for i in 0..n {
+                if is_integer_rt_format(g.targets.RTFormats[i]) {
+                    blend.RenderTarget[i].BlendEnable = false.into();
+                    changed = true;
+                }
+            }
+        }
+    } else {
+        for i in 0..n {
+            if is_integer_rt_format(g.targets.RTFormats[i])
+                && blend.RenderTarget[i].BlendEnable.as_bool()
+            {
+                blend.RenderTarget[i].BlendEnable = false.into();
+                changed = true;
+            }
+        }
+    }
+    changed.then_some(blend)
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -920,5 +1071,29 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    #[test]
+    fn sanitize_integer_rt_blend_disables_only_integer_targets() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        assert!(sanitize_integer_rt_blend(&g).is_none());
+
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        let fixed = sanitize_integer_rt_blend(&g).expect("should sanitize shared blend");
+        assert!(fixed.IndependentBlendEnable.as_bool());
+        assert!(fixed.RenderTarget[0].BlendEnable.as_bool());
+        assert!(fixed.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!fixed.RenderTarget[2].BlendEnable.as_bool());
+
+        g.blend.IndependentBlendEnable = true.into();
+        g.blend.RenderTarget[2].BlendEnable = true.into();
+        let fixed = sanitize_integer_rt_blend(&g).expect("should sanitize independent blend");
+        assert!(fixed.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!fixed.RenderTarget[2].BlendEnable.as_bool());
     }
 }

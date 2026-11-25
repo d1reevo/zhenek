@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
+use victory_shader::gfx10::{self, Encoding};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -16,6 +17,112 @@ use victory_shader::{
 use victory_shader::{io, resource};
 
 use crate::shader::{MAX_FILE, Source, sources};
+
+const ALL_STAGES: [HwStage; 8] = [
+    HwStage::Vs,
+    HwStage::Ps,
+    HwStage::Cs,
+    HwStage::Ms,
+    HwStage::Ls,
+    HwStage::Hs,
+    HwStage::Es,
+    HwStage::Gs,
+];
+
+#[derive(Default, Clone)]
+struct StageStats {
+    total: usize,
+    ir_ok: usize,
+    emitted: usize,
+    validated: usize,
+    pipelines: usize,
+    unsupported: usize,
+    malformed: usize,
+    isa: usize,
+    stage_unemitted: usize,
+    validator_failed: usize,
+    pipeline_failed: usize,
+}
+
+impl StageStats {
+    fn merge(&mut self, other: &StageStats) {
+        self.total += other.total;
+        self.ir_ok += other.ir_ok;
+        self.emitted += other.emitted;
+        self.validated += other.validated;
+        self.pipelines += other.pipelines;
+        self.unsupported += other.unsupported;
+        self.malformed += other.malformed;
+        self.isa += other.isa;
+        self.stage_unemitted += other.stage_unemitted;
+        self.validator_failed += other.validator_failed;
+        self.pipeline_failed += other.pipeline_failed;
+    }
+}
+
+#[derive(Default, Clone)]
+struct CohortStats {
+    total: usize,
+    emitted: usize,
+    validated: usize,
+    pipelines: usize,
+    failed: usize,
+    stage_unemitted: usize,
+    by_stage: BTreeMap<HwStage, usize>,
+    reasons: BTreeMap<String, usize>,
+    examples: Vec<String>,
+}
+
+impl CohortStats {
+    fn note_example(&mut self, example: String) {
+        if self.examples.len() < 8 && !self.examples.contains(&example) {
+            self.examples.push(example);
+        }
+    }
+
+    fn merge(&mut self, other: CohortStats) {
+        self.total += other.total;
+        self.emitted += other.emitted;
+        self.validated += other.validated;
+        self.pipelines += other.pipelines;
+        self.failed += other.failed;
+        self.stage_unemitted += other.stage_unemitted;
+        for (k, n) in other.by_stage {
+            *self.by_stage.entry(k).or_default() += n;
+        }
+        for (k, n) in other.reasons {
+            *self.reasons.entry(k).or_default() += n;
+        }
+        self.examples.extend(other.examples);
+        self.examples.sort();
+        self.examples.dedup();
+        self.examples.truncate(8);
+    }
+}
+
+#[derive(Default, Clone)]
+struct FailEntry {
+    count: usize,
+    kind: &'static str,
+    stages: BTreeMap<String, usize>,
+    examples: Vec<String>,
+}
+
+impl FailEntry {
+    fn merge(&mut self, other: FailEntry) {
+        self.count += other.count;
+        if self.kind.is_empty() {
+            self.kind = other.kind;
+        }
+        for (s, n) in other.stages {
+            *self.stages.entry(s).or_default() += n;
+        }
+        self.examples.extend(other.examples);
+        self.examples.sort();
+        self.examples.dedup();
+        self.examples.truncate(5);
+    }
+}
 
 #[derive(Default)]
 struct Tally {
@@ -69,25 +176,48 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
-    /// Reason → programs stopped by it, and the first one.
-    failed: BTreeMap<String, (usize, String)>,
+    /// Native mesh layout counts, before resource tracking or lowering.
+    mesh_layouts: BTreeMap<(u32, u32, u32, u8), usize>,
+    /// Detailed per-stage breakdown across all 8 GFX10 hardware stages.
+    by_stage: BTreeMap<HwStage, StageStats>,
+    /// Feature cohorts: Wave64, LDS, image_bvh*_intersect_ray, merged stages.
+    wave64: CohortStats,
+    lds: CohortStats,
+    bvh_ray: CohortStats,
+    merged_stages: CohortStats,
+    merged_containers: usize,
+    /// Reason → programs stopped by it, error kind, per-stage counts, examples.
+    failed: BTreeMap<String, FailEntry>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
 }
 
 impl Tally {
-    fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
+    fn fail_with(
+        &mut self,
+        kind: &'static str,
+        stage: Option<HwStage>,
+        reason: String,
+        example: impl FnOnce() -> String,
+    ) {
+        let e = example();
         if self.list {
-            let e = example();
             self.lines.push(format!("{e}  {reason}"));
-            self.failed.entry(reason).or_insert((0, e)).0 += 1;
-            return;
         }
-        self.failed
-            .entry(reason)
-            .or_insert_with(|| (0, example()))
-            .0 += 1;
+        let entry = self.failed.entry(reason).or_insert_with(|| FailEntry {
+            count: 0,
+            kind,
+            stages: BTreeMap::new(),
+            examples: Vec::new(),
+        });
+        entry.count += 1;
+        if let Some(st) = stage {
+            *entry.stages.entry(format!("{st:?}")).or_default() += 1;
+        }
+        if entry.examples.len() < 5 && !entry.examples.contains(&e) {
+            entry.examples.push(e);
+        }
     }
 
     fn merge(&mut self, other: Tally) {
@@ -130,12 +260,23 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        for (layout, n) in other.mesh_layouts {
+            *self.mesh_layouts.entry(layout).or_default() += n;
+        }
+        for (st, stats) in other.by_stage {
+            self.by_stage.entry(st).or_default().merge(&stats);
+        }
+        self.wave64.merge(other.wave64);
+        self.lds.merge(other.lds);
+        self.bvh_ray.merge(other.bvh_ray);
+        self.merged_stages.merge(other.merged_stages);
+        self.merged_containers += other.merged_containers;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
-        for (reason, (n, example)) in other.failed {
-            self.failed.entry(reason).or_insert((0, example)).0 += n;
+        for (reason, entry) in other.failed {
+            self.failed.entry(reason).or_default().merge(entry);
         }
     }
 }
@@ -293,10 +434,87 @@ pub fn run(
     for l in lines {
         println!("{l}");
     }
+    println!("\nstage breakdown:");
+    println!(
+        "  {:<4} {:>7} {:>7} {:>7} {:>9} {:>9} {:>11} {:>9} {:>5} {:>10} {:>7} {:>7}",
+        "stg", "total", "ir_ok", "emit", "validated", "pipelines", "unsupported", "malformed", "isa", "unemitted", "val_err", "pso_err"
+    );
+    for st in ALL_STAGES {
+        let s = t.by_stage.get(&st).cloned().unwrap_or_default();
+        println!(
+            "  {:<4} {:>7} {:>7} {:>7} {:>9} {:>9} {:>11} {:>9} {:>5} {:>10} {:>7} {:>7}",
+            format!("{st:?}"),
+            s.total,
+            s.ir_ok,
+            s.emitted,
+            s.validated,
+            s.pipelines,
+            s.unsupported,
+            s.malformed,
+            s.isa,
+            s.stage_unemitted,
+            s.validator_failed,
+            s.pipeline_failed
+        );
+    }
+    if !t.mesh_layouts.is_empty() {
+        println!("\nnative mesh layouts (before lowering):");
+        for ((threads, vertices, primitives, topology), n) in t.mesh_layouts {
+            println!(
+                "  [{threads}, 1, 1] vertices={vertices} primitives={primitives} topology={topology}: {n}"
+            );
+        }
+    }
+    println!("\nfeature cohorts:");
+    for (name, c) in [
+        ("wave64", &t.wave64),
+        ("lds", &t.lds),
+        ("image_bvh*_intersect_ray", &t.bvh_ray),
+        ("merged_stages", &t.merged_stages),
+    ] {
+        let stages_str: Vec<String> = c
+            .by_stage
+            .iter()
+            .map(|(st, n)| format!("{st:?}={n}"))
+            .collect();
+        println!(
+            "  {name:<26} total={} emitted={} validated={} pipelines={} failed={} stage_unemitted={} stages=[{}]",
+            c.total,
+            c.emitted,
+            c.validated,
+            c.pipelines,
+            c.failed,
+            c.stage_unemitted,
+            stages_str.join(", ")
+        );
+        if name == "merged_stages" {
+            println!("    multi-program containers: {}", t.merged_containers);
+        }
+        let mut reasons: Vec<_> = c.reasons.iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        for (r, n) in reasons.iter().take(12) {
+            println!("    fail {:>5}  {r}", n);
+        }
+        if !c.examples.is_empty() {
+            println!("    examples: {}", c.examples.join(" ; "));
+        }
+    }
+    println!("\nfailures by reason:");
     let mut failed: Vec<_> = t.failed.into_iter().collect();
-    failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
-    for (reason, (n, example)) in failed {
-        println!("  {n:>7}  {reason}  (e.g. {example})");
+    failed.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
+    for (reason, entry) in failed {
+        let st: Vec<String> = entry
+            .stages
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect();
+        let ex = entry.examples.join(" ; ");
+        println!(
+            "  {:>7}  [{:<11}]  {reason}  stages=[{}]  (e.g. {ex})",
+            entry.count,
+            entry.kind,
+            st.join(",")
+        );
     }
     Ok(())
 }
@@ -310,7 +528,7 @@ fn translate(
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        return t.fail_with("Malformed", None, "corrupt record".into(), example);
     };
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
@@ -318,10 +536,10 @@ fn translate(
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+        return t.fail_with("Container", None, "no DXIL part (SM5 or older)".into(), example);
     };
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+        return t.fail_with("Container", None, "no DXIL part (SM5 or older)".into(), example);
     };
     // `~`: the hash of the code alone; containers that differ only around
     // it are translated once, the others listed as duplicates of it.
@@ -355,31 +573,98 @@ fn translate(
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
-        Err(e) => return t.fail(e.to_string(), example),
+        Err(e) => {
+            let kind = error_kind(&e);
+            return t.fail_with(kind, None, e.to_string(), example);
+        }
     };
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before: Option<BTreeMap<String, usize>> = dump
+        .as_ref()
+        .map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.count)).collect());
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
-        for (reason, (n, _)) in &t.failed {
+        for (reason, entry) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
-            if *n > was && was < 3 {
-                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
+            if entry.count > was && was < 3 {
+                let stem: String = reason
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .take(60)
+                    .collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                let _ = std::fs::write(
+                    std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")),
+                    &bytes[..],
+                );
             }
         }
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn error_kind(e: &ShaderError) -> &'static str {
+    match e {
+        ShaderError::Unsupported { .. } => "Unsupported",
+        ShaderError::Malformed(_) | ShaderError::NotDxbc => "Malformed",
+        ShaderError::Isa { .. } => "Isa",
+    }
+}
+
+fn uses_lds(p: &NativeProgram, decoded: Option<&[gfx10::Instruction]>) -> bool {
+    p.lds_bytes() > 0
+        || decoded.is_some_and(|insts| {
+            insts.iter().any(|i| {
+                i.encoding == Encoding::Ds
+                    && !i
+                        .name()
+                        .is_some_and(|n| n.starts_with("ds_swizzle") || n.contains("permute"))
+            })
+        })
+}
+
+fn uses_bvh_ray(decoded: Option<&[gfx10::Instruction]>) -> bool {
+    decoded.is_some_and(|insts| {
+        insts
+            .iter()
+            .any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
+    })
+}
+
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
+    let multi_program = programs.len() > 1;
+    if multi_program {
+        t.merged_containers += 1;
+    }
     for p in programs {
+        if let victory_shader::native::StageIo::Ms(ms) = &p.io {
+            let layout = (ms.threads, ms.max_vertices, ms.max_primitives, ms.topology);
+            *t.mesh_layouts.entry(layout).or_default() += 1;
+        }
         t.programs += 1;
+        t.by_stage.entry(p.stage).or_default().total += 1;
+        let decoded = gfx10::decode(&p.code).ok();
+        let is_wave64 = p.wave64;
+        let is_lds = uses_lds(&p, decoded.as_deref());
+        let is_bvh = uses_bvh_ray(decoded.as_deref());
+        let is_merged =
+            multi_program || matches!(p.stage, HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs);
+        let mut primary_err: Option<(&'static str, String)> = None;
+        let mut emitted = false;
+        let mut validated = false;
+        let mut pipelined = false;
+        let mut stage_unemitted = false;
         match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
+                t.by_stage.entry(p.stage).or_default().ir_ok += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
@@ -391,13 +676,20 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
-                        t.fail(format!("resources: {what}"), || {
+                        let reason = format!("resources: {what}");
+                        primary_err.get_or_insert(("Unsupported", reason.clone()));
+                        t.fail_with("Unsupported", Some(p.stage), reason, || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
                         });
                         None
                     }
                     Err(e) => {
-                        t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage));
+                        let kind = error_kind(&e);
+                        let reason = e.to_string();
+                        primary_err.get_or_insert((kind, reason.clone()));
+                        t.fail_with(kind, Some(p.stage), reason, || {
+                            format!("{} {:?}", example(), p.stage)
+                        });
                         None
                     }
                 };
@@ -413,11 +705,21 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                             }
                             raised = Some(r);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("I/O: {what}"), || {
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            let reason = format!("I/O: {what}");
+                            primary_err.get_or_insert(("Unsupported", reason.clone()));
+                            t.fail_with("Unsupported", Some(p.stage), reason, || {
                                 format!("{} {:?} at {offset:#x}", example(), p.stage)
-                            }),
-                        Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
+                            });
+                        }
+                        Err(e) => {
+                            let kind = error_kind(&e);
+                            let reason = e.to_string();
+                            primary_err.get_or_insert((kind, reason.clone()));
+                            t.fail_with(kind, Some(p.stage), reason, || {
+                                format!("{} {:?}", example(), p.stage)
+                            });
+                        }
                     }
                 }
                 let structured = match structured {
@@ -426,12 +728,16 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Some(s)
                     }
                     Err(e) => {
+                        let kind = error_kind(&e);
                         let reason = match e {
                             ShaderError::Unsupported { what, .. } => format!("structure: {what}"),
                             ShaderError::Isa { reason, .. } => format!("structure: {reason}"),
                             e => e.to_string(),
                         };
-                        t.fail(reason, || format!("{} {:?}", example(), p.stage));
+                        primary_err.get_or_insert((kind, reason.clone()));
+                        t.fail_with(kind, Some(p.stage), reason, || {
+                            format!("{} {:?}", example(), p.stage)
+                        });
                         None
                     }
                 };
@@ -441,34 +747,98 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            t.by_stage.entry(p.stage).or_default().emitted += 1;
+                            emitted = true;
+                            let (val_ok, pso_ok) = check(shader, t, checks, label);
+                            validated = val_ok;
+                            pipelined = pso_ok;
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            let reason = format!("emit: {what}");
+                            primary_err.get_or_insert(("Unsupported", reason.clone()));
+                            t.fail_with("Unsupported", Some(p.stage), reason, || {
                                 format!("{} at {offset:#x}", label())
-                            }),
-                        Err(e) => t.fail(format!("emit: {e}"), label),
+                            });
+                        }
+                        Err(e) => {
+                            let kind = error_kind(&e);
+                            let reason = format!("emit: {e}");
+                            primary_err.get_or_insert((kind, reason.clone()));
+                            t.fail_with(kind, Some(p.stage), reason, label);
+                        }
                     }
+                } else if !matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms)
+                    && primary_err.is_none()
+                {
+                    stage_unemitted = true;
+                    t.by_stage.entry(p.stage).or_default().stage_unemitted += 1;
                 }
             }
             Err(e) => {
+                let kind = error_kind(&e);
                 let reason = match e {
                     ShaderError::Unsupported { what, .. } => format!("unsupported: {what}"),
                     e => e.to_string(),
                 };
-                t.fail(reason, || format!("{} {:?}", example(), p.stage));
+                primary_err = Some((kind, reason.clone()));
+                t.fail_with(kind, Some(p.stage), reason, || {
+                    format!("{} {:?}", example(), p.stage)
+                });
             }
+        }
+        if let Some((kind, _)) = &primary_err {
+            let st = t.by_stage.entry(p.stage).or_default();
+            match *kind {
+                "Unsupported" => st.unsupported += 1,
+                "Malformed" => st.malformed += 1,
+                "Isa" => st.isa += 1,
+                _ => st.unsupported += 1,
+            }
+        }
+        let note = |c: &mut CohortStats| {
+            c.total += 1;
+            *c.by_stage.entry(p.stage).or_default() += 1;
+            if emitted {
+                c.emitted += 1;
+                if validated {
+                    c.validated += 1;
+                }
+                if pipelined {
+                    c.pipelines += 1;
+                }
+            } else if stage_unemitted {
+                c.stage_unemitted += 1;
+                c.note_example(format!("{} {:?}", example(), p.stage));
+            } else if let Some((_, reason)) = &primary_err {
+                c.failed += 1;
+                *c.reasons.entry(reason.clone()).or_default() += 1;
+                c.note_example(format!("{} {:?} ({reason})", example(), p.stage));
+            }
+        };
+        if is_wave64 {
+            note(&mut t.wave64);
+        }
+        if is_lds {
+            note(&mut t.lds);
+        }
+        if is_bvh {
+            note(&mut t.bvh_ray);
+        }
+        if is_merged {
+            note(&mut t.merged_stages);
         }
     }
 }
 
-/// Validates an emitted shader if asked to.
+/// Validates an emitted shader if asked to; returns `(validated, pipelined)`.
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
-) {
+) -> (bool, bool) {
+    let mut val_ok = false;
+    let mut pso_ok = false;
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
@@ -495,19 +865,26 @@ fn check(
         match made {
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;
+                t.by_stage.entry(shader.stage).or_default().pipelines += 1;
+                pso_ok = true;
                 if t.list {
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
-            Err(e) => t.fail(format!("pipeline: {e}"), &label),
+            Err(e) => {
+                t.by_stage.entry(shader.stage).or_default().pipeline_failed += 1;
+                t.fail_with("Pipeline", Some(shader.stage), format!("pipeline: {e}"), &label);
+            }
         }
     }
     let Some(v) = checks.validator.as_mut() else {
-        return;
+        return (val_ok, pso_ok);
     };
     match v.validate(&mut shader.dxil) {
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
+            t.by_stage.entry(shader.stage).or_default().validated += 1;
+            val_ok = true;
             if t.list {
                 t.lines.push(format!("{}  validated", label()));
             }
@@ -522,7 +899,7 @@ fn check(
                 let n = t
                     .failed
                     .get(&format!("validator: {first}"))
-                    .map_or(0, |f| f.0);
+                    .map_or(0, |f| f.count);
                 if n < 3 {
                     let name = format!(
                         "{dir}/{}_{n}",
@@ -536,9 +913,11 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            t.by_stage.entry(shader.stage).or_default().validator_failed += 1;
+            t.fail_with("Validator", Some(shader.stage), format!("validator: {first}"), label);
         }
     }
+    (val_ok, pso_ok)
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,

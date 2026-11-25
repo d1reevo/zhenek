@@ -358,36 +358,80 @@ impl Bools {
         r
     }
 
-    fn restrict(&mut self, b: Bool, v: u32, value: bool, memo: &mut Map<Bool, Bool>) -> Bool {
-        let (bv, lo, hi) = self.nodes[b.0 as usize];
-        if bv == TERMINAL || bv > v {
-            return b;
+    /// If `b` is a constant lane mask (all, none, or a single `Atom::Constant`),
+    /// returns its 64-bit bitmask.
+    fn const_u64(&self, b: Bool) -> Option<u64> {
+        if b == Bool::FALSE {
+            return Some(0);
         }
-        if bv == v {
-            return if value { hi } else { lo };
+        if b == Bool::TRUE {
+            return Some(u64::MAX);
         }
-        if let Some(&r) = memo.get(&b) {
+        let (v, lo, hi) = self.nodes[b.0 as usize];
+        match (self.atoms.get(v as usize)?, lo, hi) {
+            (&Atom::Constant(k), Bool::FALSE, Bool::TRUE) => Some(k),
+            (&Atom::Constant(k), Bool::TRUE, Bool::FALSE) => Some(!k),
+            _ => None,
+        }
+    }
+
+    /// Whether every variable appearing in `b` was born strictly before `limit`.
+    fn all_born_before(&self, b: Bool, limit: usize) -> bool {
+        self.vars(b)
+            .into_iter()
+            .all(|v| self.born[v as usize] < limit)
+    }
+
+    /// Generalized BDD cofactor (Coudert–Madre `restrict`): simplifies `f`
+    /// assuming `c` holds (`c => (res <=> f)`), without introducing any
+    /// variable not already in `f`.
+    fn simplify_under(&mut self, f: Bool, c: Bool, memo: &mut Map<(Bool, Bool), Bool>) -> Bool {
+        if c == Bool::FALSE {
+            return Bool::FALSE;
+        }
+        if c == Bool::TRUE || f == Bool::FALSE || f == Bool::TRUE || self.overflow {
+            return f;
+        }
+        if f == c {
+            return Bool::TRUE;
+        }
+        if let Some(&r) = memo.get(&(f, c)) {
             return r;
         }
-        let l = self.restrict(lo, v, value, memo);
-        let h = self.restrict(hi, v, value, memo);
-        let r = self.mk(bv, l, h);
-        memo.insert(b, r);
+        let (fv, f0, f1) = self.nodes[f.0 as usize];
+        let (cv, c0, c1) = self.nodes[c.0 as usize];
+        let r = if cv < fv {
+            let c_or = self.or(c0, c1);
+            self.simplify_under(f, c_or, memo)
+        } else if cv == fv {
+            if c0 == Bool::FALSE {
+                self.simplify_under(f1, c1, memo)
+            } else if c1 == Bool::FALSE {
+                self.simplify_under(f0, c0, memo)
+            } else {
+                let lo = self.simplify_under(f0, c0, memo);
+                let hi = self.simplify_under(f1, c1, memo);
+                self.mk(fv, lo, hi)
+            }
+        } else {
+            let lo = self.simplify_under(f0, c, memo);
+            let hi = self.simplify_under(f1, c, memo);
+            self.mk(fv, lo, hi)
+        };
+        memo.insert((f, c), r);
         r
     }
 
-    /// `b` with each atom that `known` decides replaced by its value.
-    fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
-        for v in self.vars(b) {
-            let x = self.mk(v, Bool::FALSE, Bool::TRUE);
-            let nx = self.not(x);
-            if self.implies(known, x) {
-                b = self.restrict(b, v, true, &mut Map::default());
-            } else if self.implies(known, nx) {
-                b = self.restrict(b, v, false, &mut Map::default());
-            }
+    /// `b` simplified assuming `known` holds (`known => (res <=> b)`).
+    fn given(&mut self, b: Bool, known: Bool) -> Bool {
+        if known == Bool::TRUE || known == Bool::FALSE || b == Bool::FALSE || b == Bool::TRUE {
+            return b;
         }
-        b
+        let res = self.simplify_under(b, known, &mut Map::default());
+        if self.overflow {
+            return b;
+        }
+        res
     }
 }
 
@@ -508,17 +552,48 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// Memoized `s_wqm` results by input mask, and set of `s_wqm` outputs
+    /// (for idempotence `wqm(wqm(x)) == wqm(x)`).
+    wqm_cache: Map<Bool, Bool>,
+    wqm_outputs: HashSet<Bool>,
+    /// Active keys being resolved in `mask()`, to prevent cycles across split copies.
+    resolving: HashSet<Key>,
 }
 
-/// A mask join taken as `value` in every lane that reaches `block`: each
-/// incoming mask held (or failed) on its edge.
+/// A mask join tentatively resolved to `value` in every lane that reaches
+/// `block`: each incoming mask must agree with `value` on its edge.
 struct Join {
     block: usize,
     /// The phi value naming the join.
     id: Value,
-    value: bool,
+    value: Bool,
     derived: bool,
     args: Vec<Key>,
+}
+
+#[derive(Clone, Copy)]
+enum HalfSrc {
+    Const(u32),
+    Val(Value),
+}
+
+fn mov_b32_src(inst: &Inst, dst_val: Value) -> Option<HalfSrc> {
+    if inst.name() != "s_mov_b32" {
+        return None;
+    }
+    if !inst.writes.iter().any(|&(_, w)| w == dst_val) {
+        return None;
+    }
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    match *src.first()? {
+        Operand::Scalar { code: NULL, .. } => Some(HalfSrc::Const(0)),
+        Operand::Scalar { code, .. } => inst.read(Reg::S(code)).map(HalfSrc::Val),
+        Operand::Const(c) => crate::resource::inline(c).map(HalfSrc::Const),
+        Operand::Literal(x) => Some(HalfSrc::Const(x)),
+        _ => None,
+    }
 }
 
 /// A mask join represented as [`Atom::Phi`], whose incoming edge masks are
@@ -585,6 +660,9 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            wqm_cache: Map::default(),
+            wqm_outputs: HashSet::new(),
+            resolving: HashSet::new(),
         })
     }
 
@@ -600,6 +678,9 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.wqm_cache.clear();
+        self.wqm_outputs.clear();
+        self.resolving.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -646,6 +727,10 @@ impl<'a> Lanes<'a> {
                 self.step(inst, now);
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
+                } else if inst.write(Reg::S(EXEC)).is_some()
+                    || (p.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
+                {
+                    now = None;
                 }
             }
             if let Exit::Branch { .. } = p.blocks[b].exit
@@ -690,7 +775,7 @@ impl<'a> Lanes<'a> {
                 for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
                     let (q, taken) = self.incoming[block][n];
                     let e = self.edge(cond[q], q, taken);
-                    let (mut m, d) = self.mask(a);
+                    let (m, d) = self.mask(a);
                     if !was_derived
                         && d
                         && !self.derived_phis.contains(&id)
@@ -698,10 +783,17 @@ impl<'a> Lanes<'a> {
                     {
                         new_derived.push(id);
                     }
-                    if !value {
-                        m = self.b.not(m);
-                    }
-                    if !failed && !self.b.implies(e, m) {
+                    let ok = if value == Bool::TRUE {
+                        self.b.implies(e, m)
+                    } else if value == Bool::FALSE {
+                        let nm = self.b.not(m);
+                        self.b.implies(e, nm)
+                    } else {
+                        let diff = self.b.xor(m, value);
+                        let eq = self.b.not(diff);
+                        self.b.implies(e, eq)
+                    };
+                    if !failed && !ok {
                         wrong.push(id);
                         failed = true;
                     }
@@ -841,6 +933,149 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    fn const_bool(&mut self, v: u64) -> Bool {
+        let wave64 = self.p.wave64;
+        let v = if wave64 { v } else { v & 0xFFFF_FFFF };
+        match v {
+            0 => Bool::FALSE,
+            _ if v == u64::MAX >> (32 * u8::from(!wave64)) => Bool::TRUE,
+            _ => self.b.atom(Atom::Constant(v), 0),
+        }
+    }
+
+    /// Finds the original Wave64 register pair `(lo, hi)` that defined `v`
+    /// as its low (`!is_hi`) or high (`is_hi`) half.
+    fn pair_from_half(&self, v: Value, is_hi: bool) -> Option<Key> {
+        let p = self.p;
+        if let Some(&(b, i)) = self.defs.get(&v) {
+            let inst = &p.blocks[b].insts[i];
+            let &(Reg::S(c), _) = inst.writes.iter().find(|&&(r, w)| w == v && matches!(r, Reg::S(_)))? else {
+                return None;
+            };
+            let other = if is_hi { c.checked_sub(1)? } else { c.checked_add(1)? };
+            let o = inst.write(Reg::S(other))?;
+            return Some(if is_hi { (o, v) } else { (v, o) });
+        }
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            let Reg::S(c) = p.blocks[b].phis[i].reg else {
+                return None;
+            };
+            let other = if is_hi { c.checked_sub(1)? } else { c.checked_add(1)? };
+            let o = p.blocks[b]
+                .phis
+                .iter()
+                .find(|q| q.reg == Reg::S(other))?
+                .value;
+            return Some(if is_hi { (o, v) } else { (v, o) });
+        }
+        let &(Reg::S(c), _) = p.inputs.iter().find(|&&(r, w)| w == v && matches!(r, Reg::S(_)))? else {
+            return None;
+        };
+        let other = if is_hi { c.checked_sub(1)? } else { c.checked_add(1)? };
+        let o = p.inputs.iter().find(|&&(r, _)| r == Reg::S(other))?.1;
+        Some(if is_hi { (o, v) } else { (v, o) })
+    }
+
+    fn is_known_pair(&self, k: Key) -> bool {
+        self.masks.contains_key(&k)
+            || self.other.contains_key(&k)
+            || self.pair_from_half(k.0, false) == Some(k)
+            || self.pair_from_half(k.1, true) == Some(k)
+    }
+
+    fn is_split_mov(&self, k: Key) -> bool {
+        if !self.p.wave64 || k.0 == k.1 {
+            return false;
+        }
+        let p = self.p;
+        let is_mov = |v: Value| {
+            self.defs
+                .get(&v)
+                .is_some_and(|&(b, i)| mov_b32_src(&p.blocks[b].insts[i], v).is_some())
+        };
+        is_mov(k.0) || is_mov(k.1)
+    }
+
+    /// Resolves a Wave64 mask pair whose halves were written by separate
+    /// 32-bit `s_mov_b32` instructions (half-EXEC constants, split SGPR copies).
+    fn split_half_mask(&mut self, k: Key, exec_write: bool) -> Option<(Bool, bool)> {
+        if !self.p.wave64 || k.0 == k.1 || !self.resolving.insert(k) {
+            return None;
+        }
+        let p = self.p;
+        let lo_mov = self
+            .defs
+            .get(&k.0)
+            .copied()
+            .and_then(|(b, i)| mov_b32_src(&p.blocks[b].insts[i], k.0));
+        let hi_mov = self
+            .defs
+            .get(&k.1)
+            .copied()
+            .and_then(|(b, i)| mov_b32_src(&p.blocks[b].insts[i], k.1));
+        let out = match (lo_mov, hi_mov) {
+            (Some(HalfSrc::Val(s_lo)), Some(HalfSrc::Val(s_hi))) => {
+                let (m, d) = self.mask((s_lo, s_hi));
+                Some((m, d || exec_write))
+            }
+            (Some(HalfSrc::Const(c_lo)), Some(HalfSrc::Const(c_hi))) => {
+                let combined = u64::from(c_lo) | (u64::from(c_hi) << 32);
+                Some((self.const_bool(combined), exec_write))
+            }
+            (Some(HalfSrc::Val(s_lo)), None)
+                if s_lo != k.0 && self.is_known_pair((s_lo, k.1)) =>
+            {
+                let (m, d) = self.mask((s_lo, k.1));
+                Some((m, d || exec_write))
+            }
+            (None, Some(HalfSrc::Val(s_hi)))
+                if s_hi != k.1 && self.is_known_pair((k.0, s_hi)) =>
+            {
+                let (m, d) = self.mask((k.0, s_hi));
+                Some((m, d || exec_write))
+            }
+            (Some(HalfSrc::Const(c_lo)), None) => {
+                self.pair_from_half(k.1, true)
+                    .filter(|&pair| pair != k)
+                    .map(|pair| {
+                        let (hi_m, hi_d) = self.mask(pair);
+                        let m = if let Some(h_bits) = self.b.const_u64(hi_m) {
+                            let combined = u64::from(c_lo) | (h_bits & 0xFFFF_FFFF_0000_0000);
+                            self.const_bool(combined)
+                        } else {
+                            let hi_half = self.const_bool(0xFFFF_FFFF_0000_0000);
+                            let lo_const = self.const_bool(u64::from(c_lo));
+                            self.b.ite(hi_half, hi_m, lo_const)
+                        };
+                        (m, hi_d || exec_write)
+                    })
+            }
+            (None, Some(HalfSrc::Const(c_hi))) => {
+                if let Some(pair) = self.pair_from_half(k.0, false).filter(|&pair| pair != k) {
+                    let (lo_m, lo_d) = self.mask(pair);
+                    let m = if let Some(l_bits) = self.b.const_u64(lo_m) {
+                        let combined = (l_bits & 0xFFFF_FFFF) | (u64::from(c_hi) << 32);
+                        self.const_bool(combined)
+                    } else {
+                        let lo_half = self.const_bool(0x0000_0000_FFFF_FFFF);
+                        let hi_const = self.const_bool(u64::from(c_hi) << 32);
+                        self.b.ite(lo_half, lo_m, hi_const)
+                    };
+                    Some((m, lo_d || exec_write))
+                } else if p.inputs.iter().any(|&(r, w)| r == Reg::S(EXEC) && w == k.0) {
+                    // Entry EXEC has all 64 lanes set even when exec_hi was overwritten before being read.
+                    let combined = 0xFFFF_FFFFu64 | (u64::from(c_hi) << 32);
+                    Some((self.const_bool(combined), true))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        self.resolving.remove(&k);
+        out
+    }
+
     /// The mask a value pair holds, and whether it derives from EXEC or a
     /// VALU result.
     fn mask(&mut self, k: Key) -> (Bool, bool) {
@@ -856,31 +1091,23 @@ impl<'a> Lanes<'a> {
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
-                let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
-                        .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
-                    _ => None,
-                };
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
                         i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
                     })
                 };
-                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
-                // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
-                let m = m.unwrap_or_else(|| {
+                let is_exec_write = exec_write(lo, k.0) || exec_write(hi, k.1);
+                let resolved = match (lo, hi) {
+                    (Some(at), Some(hi_at)) if at == hi_at => def(lo)
+                        .and_then(|i| self.sop(i))
+                        .and_then(|r| r.dst.map(|d| (d.1, r.derived || is_exec_write))),
+                    _ => self.split_half_mask(k, is_exec_write),
+                };
+                resolved.unwrap_or_else(|| {
                     let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
-                });
-                (m, derived)
+                    (self.b.atom(Atom::Opaque(k.0), born), is_exec_write)
+                })
             }
         };
         let cache = if derived {
@@ -933,10 +1160,10 @@ impl<'a> Lanes<'a> {
             return Some((m, derived));
         }
         if !self.unresolved.contains(&id) {
-            for value in [true, false] {
+            for value in [Bool::TRUE, Bool::FALSE] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
-                    let m = if value { m } else { b.not(m) };
+                    let m = if value == Bool::TRUE { m } else { b.not(m) };
                     b.implies(e, m)
                 });
                 if holds {
@@ -947,8 +1174,34 @@ impl<'a> Lanes<'a> {
                         derived,
                         args,
                     });
-                    let m = if value { Bool::TRUE } else { Bool::FALSE };
-                    return Some((m, derived));
+                    return Some((value, derived));
+                }
+            }
+            // Loop/merge invariance: if all forward edges agree on a mask `cand`
+            // whose atoms dominate `block`, tentatively resolve the phi to `cand`
+            // and verify every edge (including back edges) in `check_joins`.
+            if let Some(&(e0, m0)) = forward.first() {
+                let cand = self.b.given(m0, e0);
+                if cand != Bool::TRUE
+                    && cand != Bool::FALSE
+                    && self.b.all_born_before(cand, self.index[block])
+                {
+                    let b = &mut self.b;
+                    let holds = forward.iter().all(|&(e, m)| {
+                        let diff = b.xor(m, cand);
+                        let eq = b.not(diff);
+                        b.implies(e, eq)
+                    });
+                    if holds {
+                        self.joins.push(Join {
+                            block,
+                            id,
+                            value: cand,
+                            derived,
+                            args,
+                        });
+                        return Some((cand, derived));
+                    }
                 }
             }
         }
@@ -1038,10 +1291,19 @@ impl<'a> Lanes<'a> {
             }
             "wqm" => {
                 let a = arg(0, self)?;
-                let lo = dst.or(exec_out)?.0;
-                let born = self.born(lo);
-                let q = self.b.atom(Atom::Quad(lo), born);
-                let r = self.b.or(a, q);
+                let r = if a == Bool::TRUE || a == Bool::FALSE || self.wqm_outputs.contains(&a) {
+                    a
+                } else if let Some(&cached) = self.wqm_cache.get(&a) {
+                    cached
+                } else {
+                    let lo = dst.or(exec_out)?.0;
+                    let born = self.born(lo);
+                    let q = self.b.atom(Atom::Quad(lo), born);
+                    let r = self.b.or(a, q);
+                    self.wqm_cache.insert(a, r);
+                    self.wqm_outputs.insert(r);
+                    r
+                };
                 (r, Some(r))
             }
             "cselect" => {
@@ -1144,11 +1406,16 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        let split_mov = self.is_split_mov(k);
+                        takes_mask |=
+                            self.masks.contains_key(&k) || (phi || split_mov) && self.mask(k).1;
                     }
                 }
-                let touches_exec =
-                    inst.write(Reg::S(EXEC)).is_some() || inst.read(Reg::S(EXEC)).is_some();
+                let touches_exec = inst.write(Reg::S(EXEC)).is_some()
+                    || inst.read(Reg::S(EXEC)).is_some()
+                    || (self.p.wave64
+                        && (inst.write(Reg::S(EXEC + 1)).is_some()
+                            || inst.read(Reg::S(EXEC + 1)).is_some()));
                 if (takes_mask || touches_exec)
                     && let Some(r) = self.sop(inst).filter(|r| r.derived)
                 {
@@ -1772,6 +2039,148 @@ mod tests {
                 .iter()
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
+        );
+    }
+
+    #[test]
+    fn half_exec_writes_track_constant_lanes_without_opaque() {
+        // Wave64 whole-wave prefix-sum pattern: s_or_saveexec_b64 -1 followed by
+        // 32-bit half-writes to exec_lo (0xffff0000, 0, -1).
+        let p = build(
+            &[
+                0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+                0xBEFE_03FF,
+                0xFFFF_0000, // s_mov_b32 exec_lo, lit(0xffff0000)
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xBEFE_0380, // s_mov_b32 exec_lo, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        // No Atom::Opaque in any guard.
+        for g in s.guards.iter().flatten().flatten() {
+            for a in s.bools.support(*g) {
+                assert!(
+                    !matches!(a, Atom::Opaque(_)),
+                    "unexpected opaque atom {a:?} in guards {:?}",
+                    s.guards
+                );
+            }
+        }
+        // v0 guarded by 0xffff_ffff_ffff_0000, v1 by 0xffff_ffff_0000_0000, v2 unguarded (all lanes).
+        let g0 = s.guards[0][2].expect("v0 guard");
+        assert_eq!(
+            s.bools.support(g0),
+            vec![Atom::Constant(0xFFFF_FFFF_FFFF_0000)]
+        );
+        let g1 = s.guards[0][4].expect("v1 guard");
+        assert_eq!(
+            s.bools.support(g1),
+            vec![Atom::Constant(0xFFFF_FFFF_0000_0000)]
+        );
+        assert_eq!(s.guards[0][6], None, "exec_lo=-1 with exec_hi=-1 is all lanes");
+    }
+
+    #[test]
+    fn split_s_mov_b32_pair_copy_tracks_mask_without_opaque() {
+        // Wave64 compare written to s[2:3], copied half-by-half via s_mov_b32 into s[4:5],
+        // then consumed by v_cndmask_b32.
+        let cnd = 258 | (259 << 9) | (4 << 18);
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // v_cmp_eq_u32 s[2:3], 0, v0
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0303, // s_mov_b32 s5, s3
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v2, v3, s[4:5]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lo = p.blocks[0].insts[3].read(Reg::S(4)).unwrap();
+        let m = s.masks.get(&lo).copied().expect("s[4:5] tracked as mask");
+        assert!(
+            matches!(s.bools.support(m)[..], [Atom::Lane(_)]),
+            "expected Lane atom, got {:?}",
+            s.bools.support(m)
+        );
+    }
+
+    #[test]
+    fn wqm_is_idempotent_and_preserves_quad_for_live_mask() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE82_0A6A, // s_wqm_b64 s[2:3], vcc
+                0xBE84_0A02, // s_wqm_b64 s[4:5], s[2:3]
+                0xBE86_0A80, // s_wqm_b64 s[6:7], 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let w1 = s.masks[&p.blocks[0].insts[1].write(Reg::S(2)).unwrap()];
+        let w2 = s.masks[&p.blocks[0].insts[2].write(Reg::S(4)).unwrap()];
+        assert_eq!(w1, w2, "s_wqm(s_wqm(x)) must equal s_wqm(x)");
+        assert!(
+            s.bools.support(w1).iter().any(|a| matches!(a, Atom::Quad(_))),
+            "live s_wqm must preserve Atom::Quad for helper lanes"
+        );
+        let z_lo = p.blocks[0].insts[3].write(Reg::S(6)).unwrap();
+        assert_eq!(s.masks.get(&z_lo), None, "s_wqm(0) is constant false, not derived");
+    }
+
+    #[test]
+    fn given_simplifies_disjunctive_known_condition() {
+        let mut b = Bools::new();
+        let a = b.atom(Atom::Lane(Value(1)), 0);
+        let d = b.atom(Atom::Lane(Value(2)), 0);
+        let c = b.atom(Atom::Lane(Value(3)), 0);
+        let known = b.or(a, d);
+        let target = b.and(known, c);
+        assert_eq!(b.given(target, known), c);
+    }
+
+    #[test]
+    fn loop_invariant_saved_mask_resolves_without_phi_atom() {
+        // Wave64 loop where a compare mask in s[2:3] is preserved across the loop via
+        // save/restore into s[6:7] and read by v_cndmask_b32 inside the loop.
+        let cnd = 258 | (259 << 9) | (2 << 18);
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // 0: v_cmp_eq_u32 s[2:3], 0, v0
+                0xBE84_0380, // 8: s_mov_b32 s4, 0
+                0xBE86_0402, // 12: s_mov_b64 s[6:7], s[2:3]
+                0xD501_0001,
+                cnd,         // 16: v_cndmask_b32 v1, v2, v3, s[2:3]
+                0xBE82_0406, // 24: s_mov_b64 s[2:3], s[6:7]
+                0x8004_8104, // 28: s_add_u32 s4, s4, 1
+                0xBF0A_8404, // 32: s_cmp_lt_u32 s4, 4
+                0xBF85_FFF9, // 36: s_cbranch_scc1 -> 12
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let phi = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .find(|phi| phi.reg == Reg::S(2))
+            .expect("loop phi for s[2:3]");
+        let m = s.masks[&phi.value];
+        assert!(
+            matches!(s.bools.support(m)[..], [Atom::Lane(_)]),
+            "loop-invariant mask phi should resolve to its Lane atom, got {:?}",
+            s.bools.support(m)
         );
     }
 }

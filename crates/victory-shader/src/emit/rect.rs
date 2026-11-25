@@ -446,11 +446,10 @@ mod tests {
         let root = host.root_signature(&vs, &ps).unwrap();
         // Position (z 0.5, w 1) and an interpolant that is the position.
         let vertex = |(x, y): (f32, f32)| [x, y, 0.5, 1.0, x, y, 0.0, 1.0];
-        for (name, corners) in [
-            ("corner first", [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0)]),
-            ("corner second", [(-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)]),
-            ("corner third", [(-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]),
-        ] {
+        let source = [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0)];
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let name = format!("{order:?}");
+            let corners = order.map(|i| source[i]);
             let vertices = corners.map(vertex).concat();
             let draw = |gs: Option<&[u8]>| {
                 let pso = host

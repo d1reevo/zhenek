@@ -69,9 +69,8 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
-#[cfg(feature = "diagnostics")]
+/// Why a pipeline has no host pipeline: its shaders that do not translate,
+/// else "refused" or "being made"; `None` if it has one.
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
@@ -120,6 +119,17 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // pipeline waits on the frame's budget for nothing.
     if !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        if made.is_none() && p.graphics.is_some() {
+            static REPORTED: AtomicU64 = AtomicU64::new(0);
+            if REPORTED.fetch_add(1, Ordering::Relaxed) < 24 {
+                let failed: Vec<_> = p.shaders.iter()
+                    .filter(|shader| matches!(shader.translated.get(), Some(None)))
+                    .map(|shader| (shader.stage, &shader.hash))
+                    .collect();
+                tracing::warn!(key = %p.key, shaders = ?p.shaders, ?failed,
+                    "requested graphics pipeline could not be made");
+            }
+        }
     }
     made
 }

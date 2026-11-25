@@ -121,6 +121,21 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if path.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: the title passes a NUL-terminated path.
+    let name = unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
+    };
+    if let Some(file) = try_open_readonly_fallback(&name) {
+        tracing::info!(
+            path = name,
+            iid = iid_text(iid),
+            source = "readonly-fallback",
+            "dstorage: file opened"
+        );
+        let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+        return put(out, file);
+    }
     // Goes through `files`, so paths on our virtual drives work too.
     let handle = super::files::CreateFileW(
         path,
@@ -131,11 +146,6 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         0,
         std::ptr::null_mut(),
     );
-    // SAFETY: the title passes a NUL-terminated path.
-    let name = unsafe {
-        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
-    };
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
@@ -146,6 +156,39 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
     put(out, file)
+}
+
+/// Opens a matching `G:\...` file directly from `VICTORY_READONLY_FALLBACK_DIR`
+/// in strict read-only shared mode (never writes, never locks out torrent writes).
+fn try_open_readonly_fallback(title_path: &str) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
+    let root = std::env::var_os("VICTORY_READONLY_FALLBACK_DIR")?;
+    let bytes = title_path.as_bytes();
+    if bytes.len() < 3 || !matches!(bytes[0], b'G' | b'g') || bytes[1] != b':' {
+        return None;
+    }
+    let mut rel = &title_path[2..];
+    while let Some(rest) = rel
+        .strip_prefix('\\')
+        .or_else(|| rel.strip_prefix('/'))
+        .or_else(|| rel.strip_prefix(".\\"))
+        .or_else(|| rel.strip_prefix("./"))
+    {
+        rel = rest;
+    }
+    if rel.is_empty() || rel.contains("..") {
+        return None;
+    }
+    let candidate = std::path::PathBuf::from(root).join(rel);
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(false)
+        .create(false)
+        .truncate(false)
+        .share_mode(FILE_SHARE_ALL)
+        .open(candidate)
+        .ok()
 }
 
 /// `(capacity, name, iid, out)`.

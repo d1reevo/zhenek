@@ -7,10 +7,11 @@
 //! to the part data):
 //!
 //! ```text
-//! +0x18 "XDAT"  u32 entry count, u32 (0x24 seen), then per entry:
+//! +0x18 "XDAT"  u32 entry count, u32 entries offset (0x24), then per entry:
 //!               u32 kind, u32 offset, u32 size
+//! kind 0x0c     uncompressed "FSSM" blob
 //! kind 0x0d     "XBCH" u32 version (3), u64 packed size, u64 unpacked size,
-//!               zlib stream
+//!               zlib stream -> "FSSM" blob
 //! unpacked      "FSSM" u32 version (0x101), u64 payload size, payload
 //! payload +0x00 u64 graphics slot count (6)
 //!         +0x08 u64 record offsets: LS HS ES GS VS PS (0x08..0x30),
@@ -19,6 +20,7 @@
 //!         +0x14 u32 flags: bit 5 wave32 (else wave64)
 //!         +0x28 u64 root layout table, +0x30 u64 used-resource table
 //!               (payload-relative), +0x38 u32 and +0x3c u32 their counts
+//!         +0x4c u32 LDS bytes (`lds_byte_size`)
 //!         +0x50 u32 bits 0-9 VGPRs used, bits 20-27 SGPRs used
 //! layout  20 B: u32 root type, u32 table offset (dwords), u32 user SGPRs,
 //!               u32 base register, u8 first user-data dword, u8 root slot,
@@ -46,6 +48,22 @@
 //!     E+0xc8  32 outputs of 6 B: u8 usage, u8 row, u8 parameter (`exp
 //!             param<n>`), u8 row again, u8 slot, u8 flags (bit 0 fp16,
 //!             bit 1 two fp16 values per dword); E+0x188 u32 count
+//! ES  same 0x1f4-byte vertex layout as VS (inputs at E+0x24/E+0xc4, outputs
+//!     written to the ES->GS LDS ring at E+0xc8/E+0x188 including SV_Position
+//!     as usage 0); E+0x1ac u32 ESGS ring itemsize in dwords (`outputs * 4`)
+//! LS  same vertex-stage layout as ES/VS (inputs at E+0x24/E+0xc4, outputs
+//!     at E+0xc8/E+0x188, itemsize at E+0x1ac, LDS bytes at record+0x4c)
+//! GS  0x2a4-byte stage data:
+//!     E+0x28  u8 output topology (2 = triangle strip), u8 input vertices (3)
+//!     E+0x34  u64 GS copy shader code offset (payload-relative),
+//!     E+0x3c  u64 GS copy shader code size (0 when absent)
+//!     E+0x150 32 outputs of 6 B (as VS_OUTPUTS); E+0x210 u32 count
+//!     E+0x220 u32 SPI_VS_OUT_CONFIG, E+0x224 u32 SPI_SHADER_POS_FORMAT,
+//!             E+0x228 u32 PA_CL_VS_OUT_CNTL, E+0x234 u32 param dwords
+//!     E+0x27c u32 VGT_GSVS_RING_ITEMSIZE (dwords = max_vertices * vertex_size_dwords)
+//!     E+0x280 u32 instance count, E+0x284 u32 max vertices,
+//!     E+0x28c u32 vertex size in dwords
+//! HS  common record metadata (code, root layout, used resources, record+0x4c LDS bytes)
 //! CS  E+0x24  u32 COMPUTE_PGM_RSRC2, E+0x28 u32 x3 thread-group size
 //! MS  E+0xc8  outputs as VS, E+0x188 count; the param byte's bit 7 marks a
 //!             per-primitive output (`PSG1` row); the 3 bytes more are the
@@ -57,23 +75,31 @@
 //!     E+0x448 u16 thread-group size in lanes, u16 maximum vertices,
 //!             u16 maximum primitives, u8 user SGPRs, u8 output topology
 //!             (2 triangles); code follows at E+0x45c
-//! record +0x4c u32 LDS bytes (`lds_byte_size`; mesh programs read it here)
+//! record +0x4c u32 LDS bytes (`lds_byte_size`; mesh and merged stages read it here)
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
 //!
-//! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
-//! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
-//! 0x12 16-byte blobs (0x10 is the shader hash).
+//! Other XDAT kinds seen: 0x07 program header + bitcode (or a 28 B `NOBC`
+//! stub when stripped), 0x0a `xbop` (compiler options), 0x0c raw uncompressed
+//! `FSSM` blob, 0x0d `XBCH`-compressed `FSSM` blob, 0x0e optional 4-byte
+//! aligned metadata table (absent in GTA VI's 26,570 DXIL containers), 0x10
+//! and 0x12 16-byte hashes.
 //! Unknown versions are rejected so a format change shows up as an error.
 
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
+const XDAT_ENTRIES_OFFSET: u32 = 0x24;
 const MAX_XDAT_ENTRIES: usize = 64;
+const KIND_BITCODE: u32 = 0x07;
+const KIND_OPTIONS: u32 = 0x0a;
+const KIND_NATIVE_UNPACKED: u32 = 0x0c;
 const KIND_NATIVE: u32 = 0x0d;
+const KIND_TABLE_0E: u32 = 0x0e;
+const KIND_HASH_10: u32 = 0x10;
+const KIND_HASH_12: u32 = 0x12;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
 const FSSM_VERSION: u32 = 0x101;
@@ -115,6 +141,21 @@ const VS_INPUTS: usize = 0x24;
 const VS_INPUT_COUNT: usize = 0xc4;
 const VS_OUTPUTS: usize = 0xc8;
 const VS_OUTPUT_COUNT: usize = 0x188;
+const ES_ITEMSIZE_DWORDS: usize = 0x1ac;
+const GS_TOPOLOGY: usize = 0x28;
+const GS_INPUT_VERTICES: usize = 0x29;
+const GS_COPY_CODE_OFFSET: usize = 0x34;
+const GS_COPY_CODE_SIZE: usize = 0x3c;
+const GS_OUTPUTS: usize = 0x150;
+const GS_OUTPUT_COUNT: usize = 0x210;
+const GS_VS_OUT_CONFIG: usize = 0x220;
+const GS_POS_FORMAT: usize = 0x224;
+const GS_CLIP_CNTL: usize = 0x228;
+const GS_PARAM_DWORDS: usize = 0x234;
+const GS_RING_ITEMSIZE_DWORDS: usize = 0x27c;
+const GS_INSTANCE_COUNT: usize = 0x280;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX_SIZE_DWORDS: usize = 0x28c;
 const CS_RSRC2: usize = 0x24;
 const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
@@ -165,6 +206,20 @@ pub struct NativeProgram {
 }
 
 impl NativeProgram {
+    /// LDS allocation in bytes declared by this stage (`COMPUTE_PGM_RSRC2` for
+    /// compute, `record + 0x4c` for mesh and merged stages).
+    pub fn lds_bytes(&self) -> u32 {
+        match &self.io {
+            StageIo::Cs(cs) => cs.lds_bytes(),
+            StageIo::Ms(ms) => ms.lds_bytes,
+            StageIo::Es(es) => es.lds_bytes,
+            StageIo::Gs(gs) => gs.lds_bytes,
+            StageIo::Ls(ls) => ls.lds_bytes,
+            StageIo::Hs(hs) => hs.lds_bytes,
+            StageIo::None | StageIo::Vs { .. } | StageIo::Ps { .. } => 0,
+        }
+    }
+
     /// The code with each render target's export patched for its full
     /// 32-bit format, so exports carry the shader's values unconverted (as
     /// the console does at pipeline creation for that format).
@@ -268,6 +323,75 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    /// Export shader half of a merged ES+GS pipeline.
+    Es(EsIo),
+    /// Geometry shader half of a merged ES+GS pipeline.
+    Gs(GsIo),
+    /// Local shader half of a merged LS+HS pipeline.
+    Ls(LsIo),
+    /// Hull shader half of a merged LS+HS pipeline.
+    Hs(HsIo),
+}
+
+/// Export shader (vertex stage feeding a geometry shader via LDS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsIo {
+    /// Vertex fetch inputs (VGPR indices start after ES/GS system VGPRs, e.g. `v9+`).
+    pub inputs: Vec<VsInput>,
+    /// All outputs written to the ES->GS LDS ring, including `SV_Position` (usage 0).
+    pub outputs: Vec<VsOutput>,
+    /// Dwords written per vertex to the ES->GS LDS ring (`E+0x1ac`).
+    pub esgs_itemsize_dwords: u32,
+    pub lds_bytes: u32,
+}
+
+/// Geometry shader (merged ES+GS) stage data, including its embedded copy shader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GsIo {
+    /// Non-position `exp param<n>` outputs exported by the GS copy shader (`E+0x150`).
+    pub outputs: Vec<VsOutput>,
+    /// `VGT_GS_OUT_PRIM_TYPE` (`E+0x28`: 2 = triangle strip).
+    pub output_topology: u8,
+    /// Vertices per input primitive (`E+0x29`: 3 = triangle).
+    pub input_vertices: u8,
+    /// `SPI_VS_OUT_CONFIG` (`E+0x220`).
+    pub vs_out_config: u32,
+    /// `SPI_SHADER_POS_FORMAT` (`E+0x224`).
+    pub pos_format: u32,
+    /// `PA_CL_VS_OUT_CNTL` (`E+0x228`).
+    pub clip_cntl: u32,
+    /// Non-position parameter dwords per output vertex (`E+0x234`).
+    pub param_dwords: u32,
+    /// `VGT_GSVS_RING_ITEMSIZE`: dwords per invocation (`max_vertices * vertex_size_dwords`, `E+0x27c`).
+    pub ring_itemsize_dwords: u32,
+    /// GS instance count (`E+0x280`).
+    pub instance_count: u32,
+    /// Maximum output vertices per invocation (`E+0x284`).
+    pub max_vertices: u32,
+    /// Total output dwords per vertex including position (`E+0x28c`).
+    pub vertex_size_dwords: u32,
+    /// `record + 0x4c` LDS bytes.
+    pub lds_bytes: u32,
+    /// Embedded GFX10 GS copy shader (hardware VS reading the GSVS ring buffer), empty if absent.
+    pub copy_code: Vec<u8>,
+}
+
+/// Local shader (vertex stage feeding a hull shader in merged LS+HS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsIo {
+    pub inputs: Vec<VsInput>,
+    pub outputs: Vec<VsOutput>,
+    /// Dwords written per control point to the LS->HS LDS ring (`E+0x1ac`).
+    pub lshs_itemsize_dwords: u32,
+    pub lds_bytes: u32,
+}
+
+/// Hull shader (merged LS+HS) common metadata extracted from the FSSM record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HsIo {
+    pub lds_bytes: u32,
+    /// Byte length of the raw HS stage-data region preceding the machine code.
+    pub stage_data_len: usize,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -409,25 +533,153 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data; empty for the PC layout.
-pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+/// Known entry kinds in an Xbox `XDAT` directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum XdatKind {
+    /// `0x07`: DXIL program header + LLVM bitcode (or 28-byte `NOBC` stub).
+    Bitcode,
+    /// `0x0a`: `xbop` compiler options.
+    Options,
+    /// `0x0c`: Raw uncompressed `FSSM` native program blob.
+    NativeUnpacked,
+    /// `0x0d`: `XBCH`-compressed `FSSM` native program blob.
+    Native,
+    /// `0x0e`: Optional 4-byte aligned metadata table.
+    Table0e,
+    /// `0x10`: 16-byte shader hash.
+    Hash10,
+    /// `0x12`: 16-byte container/blob hash.
+    Hash12,
+    Other(u32),
+}
+
+impl XdatKind {
+    fn from_raw(raw: u32) -> Self {
+        match raw {
+            KIND_BITCODE => XdatKind::Bitcode,
+            KIND_OPTIONS => XdatKind::Options,
+            KIND_NATIVE_UNPACKED => XdatKind::NativeUnpacked,
+            KIND_NATIVE => XdatKind::Native,
+            KIND_TABLE_0E => XdatKind::Table0e,
+            KIND_HASH_10 => XdatKind::Hash10,
+            KIND_HASH_12 => XdatKind::Hash12,
+            other => XdatKind::Other(other),
+        }
+    }
+}
+
+/// One validated entry in an `XDAT` directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XdatEntry<'a> {
+    pub kind: XdatKind,
+    pub offset: u32,
+    pub data: &'a [u8],
+}
+
+/// Decoded `XDAT` `0x0e` table payload (4-byte aligned dword table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdatTable0e {
+    pub dwords: Vec<u32>,
+}
+
+impl XdatTable0e {
+    /// Parses a non-empty, 4-byte aligned `0x0e` metadata table.
+    pub fn parse(blob: &[u8]) -> Result<Self, ShaderError> {
+        if blob.is_empty() || blob.len() % 4 != 0 {
+            return Err(Malformed("XDAT 0x0e table has invalid size"));
+        }
+        let dwords = blob
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        Ok(XdatTable0e { dwords })
+    }
+}
+
+/// Parsed `XDAT` index embedded in an Xbox `DXIL` part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Xdat<'a> {
+    pub entries: Vec<XdatEntry<'a>>,
+    pub xbop: Option<&'a [u8]>,
+    pub table_0e: Vec<XdatTable0e>,
+    pub hash_10: Option<[u8; 16]>,
+    pub hash_12: Option<[u8; 16]>,
+}
+
+/// Parses the `XDAT` directory inside a `DXIL` part; `Ok(None)` for standard PC parts.
+pub fn parse_xdat(part: &[u8]) -> Result<Option<Xdat<'_>>, ShaderError> {
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let count = u32_at(part, XDAT_OFFSET + 4)? as usize;
     if count > MAX_XDAT_ENTRIES {
         return Err(Malformed("implausible XDAT entry count"));
     }
-    let mut out = Vec::new();
+    let table_offset = u32_at(part, XDAT_OFFSET + 8)?;
+    if table_offset != XDAT_ENTRIES_OFFSET {
+        return Err(Malformed("unexpected XDAT entries offset"));
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut xbop = None;
+    let mut table_0e = Vec::new();
+    let mut hash_10 = None;
+    let mut hash_12 = None;
     for i in 0..count {
-        let at = XDAT_OFFSET + 12 + 12 * i;
-        if u32_at(part, at)? != KIND_NATIVE {
-            continue;
+        let at = table_offset as usize + 12 * i;
+        let kind = XdatKind::from_raw(u32_at(part, at)?);
+        let offset = u32_at(part, at + 4)?;
+        let size = u32_at(part, at + 8)?;
+        let data = bytes(part, offset.into(), size.into())
+            .ok_or(Malformed("XDAT entry out of bounds"))?;
+        match kind {
+            XdatKind::Options => {
+                if data.get(0..4) != Some(b"xbop") {
+                    return Err(Malformed("XDAT options entry lacks xbop magic"));
+                }
+                xbop = Some(data);
+            }
+            XdatKind::Table0e => {
+                table_0e.push(XdatTable0e::parse(data)?);
+            }
+            XdatKind::Hash10 => {
+                hash_10 = Some(
+                    data.try_into()
+                        .map_err(|_| Malformed("unexpected XDAT 0x10 hash size"))?,
+                );
+            }
+            XdatKind::Hash12 => {
+                hash_12 = Some(
+                    data.try_into()
+                        .map_err(|_| Malformed("unexpected XDAT 0x12 hash size"))?,
+                );
+            }
+            _ => {}
         }
-        let offset = u32_at(part, at + 4)?.into();
-        let size = u32_at(part, at + 8)?.into();
-        let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        entries.push(XdatEntry { kind, offset, data });
+    }
+    Ok(Some(Xdat {
+        entries,
+        xbop,
+        table_0e,
+        hash_10,
+        hash_12,
+    }))
+}
+
+/// The native programs in a `DXIL` part's data; empty for the PC layout.
+pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+    let Some(xdat) = parse_xdat(part)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in xdat.entries {
+        match entry.kind {
+            XdatKind::Native => out.extend(programs(&unpack(entry.data)?)?),
+            XdatKind::NativeUnpacked => out.extend(programs(entry.data)?),
+            _ => {}
+        }
     }
     Ok(out)
 }
@@ -525,7 +777,10 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             })
             .collect();
         // The record is in bounds, so its end is too.
-        let stage_data = &payload[(start + RECORD_SIZE) as usize..];
+        let code_offset = u64_at(record, 0)?;
+        let stage_data_start = start + RECORD_SIZE;
+        let stage_data = &payload[stage_data_start as usize..];
+        let lds_bytes = u32_at(record, RECORD_LDS)?;
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
             HwStage::Vs => vs_io(stage_data)?,
@@ -537,8 +792,20 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                     u32_at(stage_data, CS_THREADS + 8)?,
                 ],
             }),
-            HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
-            _ => StageIo::None,
+            HwStage::Ms => ms_io(stage_data, lds_bytes)?,
+            HwStage::Es => es_io(stage_data, lds_bytes)?,
+            HwStage::Gs => gs_io(stage_data, payload, lds_bytes)?,
+            HwStage::Ls => ls_io(stage_data, lds_bytes)?,
+            HwStage::Hs => {
+                let stage_data_len = code_offset
+                    .checked_sub(stage_data_start)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or(Malformed("HS stage data overlaps record"))?;
+                StageIo::Hs(HsIo {
+                    lds_bytes,
+                    stage_data_len,
+                })
+            }
         };
         out.push(NativeProgram {
             stage,
@@ -654,6 +921,75 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
         max_primitives: half(4),
         topology: info[7],
         lds_bytes,
+    }))
+}
+
+fn es_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
+    let StageIo::Vs { inputs, outputs } = vs_io(data)? else {
+        unreachable!()
+    };
+    Ok(StageIo::Es(EsIo {
+        inputs,
+        outputs,
+        esgs_itemsize_dwords: u32_at(data, ES_ITEMSIZE_DWORDS)?,
+        lds_bytes,
+    }))
+}
+
+fn ls_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
+    let StageIo::Vs { inputs, outputs } = vs_io(data)? else {
+        unreachable!()
+    };
+    Ok(StageIo::Ls(LsIo {
+        inputs,
+        outputs,
+        lshs_itemsize_dwords: u32_at(data, ES_ITEMSIZE_DWORDS)?,
+        lds_bytes,
+    }))
+}
+
+fn gs_io(data: &[u8], payload: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
+    let outputs = semantics(data, GS_OUTPUTS, 6, GS_OUTPUT_COUNT)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|e| VsOutput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            param: e[2],
+            fp16: e[5] & 1 != 0,
+            pack2: e[5] & 2 != 0,
+        })
+        .collect();
+    let copy_offset = u64_at(data, GS_COPY_CODE_OFFSET)?;
+    let copy_size = u64_at(data, GS_COPY_CODE_SIZE)?;
+    let copy_code = if copy_size == 0 || copy_offset == ABSENT {
+        Vec::new()
+    } else {
+        bytes(payload, copy_offset, copy_size)
+            .ok_or(Malformed("GS copy shader out of bounds"))?
+            .to_vec()
+    };
+    let output_topology = *data
+        .get(GS_TOPOLOGY)
+        .ok_or(Malformed("stage data out of bounds"))?;
+    let input_vertices = *data
+        .get(GS_INPUT_VERTICES)
+        .ok_or(Malformed("stage data out of bounds"))?;
+    Ok(StageIo::Gs(GsIo {
+        outputs,
+        output_topology,
+        input_vertices,
+        vs_out_config: u32_at(data, GS_VS_OUT_CONFIG)?,
+        pos_format: u32_at(data, GS_POS_FORMAT)?,
+        clip_cntl: u32_at(data, GS_CLIP_CNTL)?,
+        param_dwords: u32_at(data, GS_PARAM_DWORDS)?,
+        ring_itemsize_dwords: u32_at(data, GS_RING_ITEMSIZE_DWORDS)?,
+        instance_count: u32_at(data, GS_INSTANCE_COUNT)?,
+        max_vertices: u32_at(data, GS_MAX_VERTICES)?,
+        vertex_size_dwords: u32_at(data, GS_VERTEX_SIZE_DWORDS)?,
+        lds_bytes,
+        copy_code,
     }))
 }
 
@@ -1019,5 +1355,248 @@ mod tests {
         let at = FSSM_HEADER + slot(HwStage::Ls);
         bad_record[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_record))])).is_err());
+    }
+
+    #[test]
+    fn parses_xdat_metadata_0e_and_raw_0c_fssm() {
+        let raw_fssm = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let table_0e: Vec<u8> = [1u32, 2, 0x10, 0x20]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let h10 = [0x11u8; 16];
+        let h12 = [0x22u8; 16];
+        let data = part(&[
+            (KIND_OPTIONS, b"xbop\x01\x00"),
+            (KIND_TABLE_0E, &table_0e),
+            (KIND_HASH_10, &h10),
+            (KIND_HASH_12, &h12),
+            (KIND_NATIVE_UNPACKED, &raw_fssm),
+        ]);
+
+        let xdat = parse_xdat(&data).unwrap().unwrap();
+        assert_eq!(xdat.entries.len(), 5);
+        assert_eq!(xdat.xbop, Some(&b"xbop\x01\x00"[..]));
+        assert_eq!(xdat.table_0e, [XdatTable0e { dwords: vec![1, 2, 0x10, 0x20] }]);
+        assert_eq!(xdat.hash_10, Some(h10));
+        assert_eq!(xdat.hash_12, Some(h12));
+
+        let found = native_programs(&data).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].stage, HwStage::Vs);
+        assert_eq!(found[0].code, VS_CODE);
+    }
+
+    #[test]
+    fn rejects_invalid_xdat_xbch_and_fssm_versions() {
+        // Unexpected XDAT entries offset (must be 0x24).
+        let mut bad_xdat = part(&[(KIND_HASH_12, &[0u8; 16])]);
+        bad_xdat[XDAT_OFFSET + 8..XDAT_OFFSET + 12].copy_from_slice(&0x28u32.to_le_bytes());
+        assert!(matches!(parse_xdat(&bad_xdat), Err(Malformed(_))));
+
+        // Misaligned / empty 0x0e table.
+        assert!(matches!(
+            parse_xdat(&part(&[(KIND_TABLE_0E, &[1, 2, 3])])),
+            Err(Malformed(_))
+        ));
+        assert!(matches!(
+            parse_xdat(&part(&[(KIND_TABLE_0E, &[])])),
+            Err(Malformed(_))
+        ));
+
+        // Wrong hash size and bad xbop magic.
+        assert!(matches!(
+            parse_xdat(&part(&[(KIND_HASH_10, &[0u8; 12])])),
+            Err(Malformed(_))
+        ));
+        assert!(matches!(
+            parse_xdat(&part(&[(KIND_OPTIONS, b"nope")])),
+            Err(Malformed(_))
+        ));
+
+        // Unknown FSSM version and unexpected FSSM slot count.
+        let mut bad_fssm_ver = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        bad_fssm_ver[4..8].copy_from_slice(&0x102u32.to_le_bytes());
+        assert!(matches!(
+            native_programs(&part(&[(KIND_NATIVE_UNPACKED, &bad_fssm_ver)])),
+            Err(Malformed(_))
+        ));
+        assert!(matches!(
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_fssm_ver))])),
+            Err(Malformed(_))
+        ));
+
+        let mut bad_slots = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        bad_slots[FSSM_HEADER..FSSM_HEADER + 8].copy_from_slice(&7u64.to_le_bytes());
+        assert!(matches!(
+            native_programs(&part(&[(KIND_NATIVE_UNPACKED, &bad_slots)])),
+            Err(Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn reads_es_and_gs_merged_stage_data() {
+        // ES with 1 input (v9) and 2 outputs (SV_Position + TEXCOORD0, 8 dwords/vert).
+        let mut es_blob = fssm(&[(HwStage::Es, &VS_CODE)]);
+        let e = stage_data_at(&es_blob, HwStage::Es);
+        es_blob[e + VS_INPUTS..][..5].copy_from_slice(&[6, 0, 7, 9, 2]);
+        es_blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        es_blob[e + VS_OUTPUTS..][..12].copy_from_slice(&[0, 0, 0, 0, 0, 0, 6, 1, 1, 0, 0, 0]);
+        es_blob[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        es_blob[e + ES_ITEMSIZE_DWORDS..][..4].copy_from_slice(&8u32.to_le_bytes());
+        let rec = e - RECORD_SIZE as usize;
+        es_blob[rec + RECORD_LDS..][..4].copy_from_slice(&4096u32.to_le_bytes());
+
+        let es = &native_programs(&part(&[(KIND_NATIVE, &xbch(&es_blob))])).unwrap()[0];
+        assert_eq!(es.lds_bytes(), 4096);
+        assert_eq!(
+            es.io,
+            StageIo::Es(EsIo {
+                inputs: vec![VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 7,
+                    vgpr: 9,
+                }],
+                outputs: vec![
+                    VsOutput {
+                        usage: Usage::Other(0),
+                        row: 0,
+                        param: 0,
+                        fp16: false,
+                        pack2: false,
+                    },
+                    VsOutput {
+                        usage: Usage::Generic,
+                        row: 1,
+                        param: 1,
+                        fp16: false,
+                        pack2: false,
+                    },
+                ],
+                esgs_itemsize_dwords: 8,
+                lds_bytes: 4096,
+            })
+        );
+
+        // GS with 2 param outputs, max_vertices=3, vertex_size=12 dwords, embedded copy shader.
+        let mut gs_blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let copy_code = [0x00u8, 0x00, 0x81, 0xBF, 0x00, 0x00, 0x80, 0xBF];
+        let copy_offset = (gs_blob.len() - FSSM_HEADER) as u64;
+        gs_blob.extend_from_slice(&copy_code);
+        let new_payload_len = (gs_blob.len() - FSSM_HEADER) as u64;
+        gs_blob[8..16].copy_from_slice(&new_payload_len.to_le_bytes());
+
+        let e = stage_data_at(&gs_blob, HwStage::Gs);
+        gs_blob[e + GS_TOPOLOGY] = 2;
+        gs_blob[e + GS_INPUT_VERTICES] = 3;
+        gs_blob[e + GS_COPY_CODE_OFFSET..][..8].copy_from_slice(&copy_offset.to_le_bytes());
+        gs_blob[e + GS_COPY_CODE_SIZE..][..8].copy_from_slice(&(copy_code.len() as u64).to_le_bytes());
+        gs_blob[e + GS_OUTPUTS..][..12].copy_from_slice(&[6, 1, 0, 0, 0, 0, 6, 2, 1, 0, 0, 1]);
+        gs_blob[e + GS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        gs_blob[e + GS_VS_OUT_CONFIG..][..4].copy_from_slice(&2u32.to_le_bytes());
+        gs_blob[e + GS_POS_FORMAT..][..4].copy_from_slice(&4u32.to_le_bytes());
+        gs_blob[e + GS_CLIP_CNTL..][..4].copy_from_slice(&0x0Fu32.to_le_bytes());
+        gs_blob[e + GS_PARAM_DWORDS..][..4].copy_from_slice(&8u32.to_le_bytes());
+        gs_blob[e + GS_RING_ITEMSIZE_DWORDS..][..4].copy_from_slice(&36u32.to_le_bytes());
+        gs_blob[e + GS_INSTANCE_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        gs_blob[e + GS_MAX_VERTICES..][..4].copy_from_slice(&3u32.to_le_bytes());
+        gs_blob[e + GS_VERTEX_SIZE_DWORDS..][..4].copy_from_slice(&12u32.to_le_bytes());
+        let rec = e - RECORD_SIZE as usize;
+        gs_blob[rec + RECORD_LDS..][..4].copy_from_slice(&8192u32.to_le_bytes());
+
+        let gs = &native_programs(&part(&[(KIND_NATIVE, &xbch(&gs_blob))])).unwrap()[0];
+        assert_eq!(gs.lds_bytes(), 8192);
+        assert_eq!(
+            gs.io,
+            StageIo::Gs(GsIo {
+                outputs: vec![
+                    VsOutput {
+                        usage: Usage::Generic,
+                        row: 1,
+                        param: 0,
+                        fp16: false,
+                        pack2: false,
+                    },
+                    VsOutput {
+                        usage: Usage::Generic,
+                        row: 2,
+                        param: 1,
+                        fp16: true,
+                        pack2: false,
+                    },
+                ],
+                output_topology: 2,
+                input_vertices: 3,
+                vs_out_config: 2,
+                pos_format: 4,
+                clip_cntl: 0x0F,
+                param_dwords: 8,
+                ring_itemsize_dwords: 36,
+                instance_count: 1,
+                max_vertices: 3,
+                vertex_size_dwords: 12,
+                lds_bytes: 8192,
+                copy_code: copy_code.to_vec(),
+            })
+        );
+
+        // Out-of-bounds GS copy shader must be rejected.
+        gs_blob[e + GS_COPY_CODE_SIZE..][..8].copy_from_slice(&9999u64.to_le_bytes());
+        assert!(matches!(
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&gs_blob))])),
+            Err(Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn reads_ls_and_hs_merged_stage_data() {
+        let mut blob = fssm(&[(HwStage::Ls, &VS_CODE), (HwStage::Hs, &PS_CODE)]);
+        let ls_e = stage_data_at(&blob, HwStage::Ls);
+        blob[ls_e + VS_INPUTS..][..5].copy_from_slice(&[6, 0, 7, 4, 2]);
+        blob[ls_e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        blob[ls_e + VS_OUTPUTS..][..6].copy_from_slice(&[6, 0, 0, 0, 0, 0]);
+        blob[ls_e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        blob[ls_e + ES_ITEMSIZE_DWORDS..][..4].copy_from_slice(&4u32.to_le_bytes());
+        let ls_rec = ls_e - RECORD_SIZE as usize;
+        blob[ls_rec + RECORD_LDS..][..4].copy_from_slice(&2048u32.to_le_bytes());
+
+        let hs_e = stage_data_at(&blob, HwStage::Hs);
+        let hs_rec = hs_e - RECORD_SIZE as usize;
+        blob[hs_rec + RECORD_LDS..][..4].copy_from_slice(&16384u32.to_le_bytes());
+
+        let found = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].stage, HwStage::Ls);
+        assert_eq!(found[0].lds_bytes(), 2048);
+        assert_eq!(
+            found[0].io,
+            StageIo::Ls(LsIo {
+                inputs: vec![VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 7,
+                    vgpr: 4,
+                }],
+                outputs: vec![VsOutput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+                lshs_itemsize_dwords: 4,
+                lds_bytes: 2048,
+            })
+        );
+        assert_eq!(found[1].stage, HwStage::Hs);
+        assert_eq!(found[1].lds_bytes(), 16384);
+        assert_eq!(
+            found[1].io,
+            StageIo::Hs(HsIo {
+                lds_bytes: 16384,
+                stage_data_len: STAGE_DATA,
+            })
+        );
     }
 }
