@@ -79,6 +79,7 @@ fn build() -> [u8; 32] {
             "VICTORY_THREAD_TICKET",
             "VICTORY_DESCRIPTOR_REMAP",
             "VICTORY_WATER_LIGHT",
+            "VICTORY_WAVE_PAIRS_FP32",
             "VICTORY_LDS_INIT_HOIST",
         ] {
             bytes.extend_from_slice(name.as_bytes());

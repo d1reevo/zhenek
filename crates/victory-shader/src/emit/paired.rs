@@ -207,6 +207,24 @@ impl<'a> Lower<'a> {
         };
         match inst.name() {
             "v_readlane_b32" => {
+                if let Some(&(_, w)) = inst.writes.first()
+                    && let Some((start, sh)) = self.sections.get(&b).and_then(|s| {
+                        s.iter()
+                            .filter(|s| s.1.end < i)
+                            .find_map(|(&start, sec)| sec.reads.get(&w).copied().map(|sh| (start, sh)))
+                    })
+                {
+                    use super::super::wave::Shape;
+                    let [lo, hi] = match sh {
+                        Shape::ActiveF64(lo, hi, mask, high) => {
+                            self.paired_f64_constant_sum(b, start, lo, hi, mask, high)?
+                        }
+                        sh @ (Shape::Active(..) | Shape::Prefix(..)) => self.paired_shape(sh)?,
+                        sh => self.both(|l| l.shape(sh, false))?,
+                    };
+                    self.put_lanes(w, Val::I32(lo), Val::I32(hi));
+                    return Ok(());
+                }
                 // the lane: a scalar or a constant
                 if inst.reads.iter().any(|r| self.lane_scalars.contains(&r.1)) {
                     return Err("a paired lane read with a lane-varying scalar index");

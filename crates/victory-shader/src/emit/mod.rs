@@ -385,6 +385,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(u8::from(std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1")));
     out.push(u8::from(std::env::var_os("VICTORY_LDS_INIT_HOIST").is_none_or(|v| v != "0")));
+    out.push(u8::from(std::env::var_os("VICTORY_WAVE_PAIRS_FP32").is_some_and(|v| v == "non-ieee-rne-ftz")));
     out
 }
 
