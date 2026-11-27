@@ -1,8 +1,8 @@
 <div align="center">
 
-# VIctory on NVIDIA — 8 GB VRAM Edition (RTX 60 / 70 Series)
+# zhenek
 
-**Xbox Series → Windows D3D12 compatibility layer tuned for mainstream 8 GB NVIDIA RTX GPUs (RTX 3060 / 3060 Ti / 3070 / 4060 / 4060 Ti / 4070 / 5060)**  
+**`VIctory` fork built specifically for budget 60/70-series 8 GB NVIDIA GPUs (RTX 3060 / 3060 Ti / 3070 / 4060 / 4060 Ti / 4070 / 5060)**  
 *Branch: `rtx5060-8gb-clean` · Anti-paging 8 GB VRAM pool + Native DLSS Super Resolution & DLSS Frame Generation (2x–6x)*
 
 [![Branch](https://img.shields.io/badge/Branch-rtx5060--8gb--clean-2ea043?style=for-the-badge&logo=git&logoColor=white)](https://github.com/d1reevo/zhenek/tree/rtx5060-8gb-clean)
