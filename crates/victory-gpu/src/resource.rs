@@ -1882,9 +1882,18 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     {
         return false;
     }
+    // Hard anti-paging ceiling on raw DXGI VRAM usage:
+    // - Heap growth (`host_texture_as` `can_grow_vram`) stops strictly at 84%
+    //   of DXGI budget to prevent WDDM PCIe paging (100-400 ms GPU stalls).
+    // - `room()` enforces <= 89% raw used when pool free holes are < 64 MiB, and
+    //   allows reusing >= 64 MiB of already-allocated pool holes (0 MB DXGI
+    //   growth) up to 93% raw used so character/face textures never starve.
+    let pool_free = crate::pool::texture_room();
     if let Some([budget, used, ..]) = memory
         && budget > 0
-        && used.saturating_sub(crate::pool::texture_room()) >= budget / 100 * 95
+        && (used >= budget / 100 * 93
+            || (pool_free < (64 << 20) && used >= budget / 100 * 89)
+            || used.saturating_sub(pool_free) >= budget / 100 * 95)
     {
         return false;
     }
@@ -2497,11 +2506,17 @@ fn collect_slot_evict_candidates(
     if used < target {
         return None;
     }
-    let need = used.saturating_sub(budget / 100 * percent.saturating_sub(4)).min(cap);
+    let need = used
+        .saturating_sub(budget / 100 * percent.saturating_sub(4))
+        .min(cap);
     if need == 0 {
         return None;
     }
-    let eff_idle = idle_ms.min(20_000).max(10_000);
+    // Keep live cutscene/character textures safe: require real VRAM pressure
+    // (`used >= target`), at least 15–20 s of idle time, and at least 240 frames
+    // since last CPU/resource touch.
+    let eff_idle = idle_ms.clamp(15_000, 20_000);
+    let min_frames = frames.max(240);
     let mut candidates: Vec<(u64, usize, usize, u64)> = Vec::new();
     let mut raws: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for &at in all.iter() {
@@ -2511,7 +2526,7 @@ fn collect_slot_evict_candidates(
             continue;
         }
         let used_at = r.host.used.load(Relaxed);
-        if used_at == 0 || !crate::host::long_ago(used_at, eff_idle, frames) {
+        if used_at == 0 || !crate::host::long_ago(used_at, eff_idle, min_frames) {
             continue;
         }
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2946,24 +2961,43 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
+    // in no texel). For speculative bindless queue uploads, never grow new
+    // DXGI VRAM past 89% of budget (still allowing reuse of existing free holes
+    // inside already-allocated pool heaps so characters/faces never starve).
+    let speculative_fill = fills(desc) && crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+    let can_grow_vram = || {
+        !speculative_fill
+            || !matches!(
+                host.video_memory(),
+                Some([budget, used, ..]) if budget > 0 && used >= budget / 100 * 84
+            )
+    };
     if fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+    {
         // SAFETY: the description has the host layout, as below.
-        && let Some(t) = unsafe {
-            crate::pool::texture(
+        match unsafe {
+            crate::pool::texture_capped(
                 &host.device,
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+                can_grow_vram,
             )
+        } {
+            crate::pool::PoolTexture::Placed(t) => {
+                crate::host::name(&t, || {
+                    format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
+                });
+                return Some(t);
+            }
+            crate::pool::PoolTexture::GrowthBlocked => return None,
+            crate::pool::PoolTexture::NotPooled => {}
         }
-    {
-        crate::host::name(&t, || {
-            format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
-        });
-        return Some(t);
+    }
+    if speculative_fill && !reserved && !can_grow_vram() {
+        return None;
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {

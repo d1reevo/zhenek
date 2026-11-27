@@ -355,18 +355,36 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
-            continue;
+        if ran.contains(&i) {
+            keep_idle(host);
         }
-        // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
-        let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
+    }
+}
+
+/// Reuse a completed command list independently of its recorded resources.
+#[cfg(windows)]
+pub(crate) fn recycle_landed(lists: Vec<Detached>, ran: &[usize]) {
+    for (i, Detached { mut host, _uploads, _state }) in lists.into_iter().enumerate() {
+        if pools() && ran.contains(&i) {
+            crate::host::retire((_state, _uploads, host.take_landed_objects()));
+            keep_idle(host);
+        } else {
+            crate::host::retire((_state, _uploads, host));
         }
+    }
+}
+
+#[cfg(windows)]
+fn keep_idle(host: crate::host::HostList) {
+    if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        return;
+    }
+    host.reset();
+    let bytes = host.scratch_kept();
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        idle.0.push(Idle(host, bytes));
+        idle.1 += bytes;
     }
 }
 

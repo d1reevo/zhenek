@@ -1403,18 +1403,16 @@ impl TextureQueue {
     ///   first 3D frames).
     #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let (due, _) = self.due_and_census(frame);
+        let (due, _) = self.due_and_census(frame, max != 0);
         due.order(max)
     }
 
     /// [`TextureQueue::due`]'s slots, not in order yet, and
     /// [`TextureQueue::census`], in one look at every slot: what the queue's
-    /// lock is held for. The order is made after it is let go
-    /// ([`Due::order`]). Ordered under the lock, the queue of some 40,000
-    /// slots in the first gameplay area kept it 1-5 ms a pass, and the
-    /// title's recording threads, whose every descriptor copy notes its slot
-    /// here, waited that long behind it (run timeline, 2026-11-26).
-    fn due_and_census(&self, frame: u64) -> (Due, [u64; 6]) {
+    /// lock is held for. A counts-only pass (`collect_slots == false`) allocates
+    /// no due slot lists. The order is made after the lock is let go
+    /// ([`Due::order`]).
+    fn due_and_census(&self, frame: u64, collect_slots: bool) -> (Due, [u64; 6]) {
         let mut due = Due::default();
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
         for (&index, w) in &self.slots {
@@ -1431,12 +1429,14 @@ impl TextureQueue {
                 if !again {
                     c[4] = c[4].max(frame.saturating_sub(w.written));
                 }
-                if w.looks > 0 || w.mapped > 0 {
-                    // (Only these can wait for a look again: `recheck`
-                    // leaves a look, `partly` some bytes mapped.)
-                    due.again.push((w.written, index, w.write, Some(w.checked).filter(|c| c.2 != 0)));
-                } else {
-                    due.fresh.push((w.written, index, w.write));
+                if collect_slots {
+                    if w.looks > 0 || w.mapped > 0 {
+                        // (Only these can wait for a look again: `recheck`
+                        // leaves a look, `partly` some bytes mapped.)
+                        due.again.push((w.written, index, w.write, Some(w.checked).filter(|c| c.2 != 0)));
+                    } else {
+                        due.fresh.push((w.written, index, w.write));
+                    }
                 }
             }
         }
@@ -2168,8 +2168,8 @@ struct ViewRemap {
 impl ViewRemap {
     fn new(host: &crate::host::Host, count: u32, extra: u32, null: u32) -> Option<Self> {
         use victory_shader::emit::SLOT_STRIDES_COUNT;
-        let direct = count.min(null.saturating_sub(DYNAMIC));
-        let spill_end = null - extra;
+        let spill_end = null.saturating_sub(extra);
+        let direct = count.min(spill_end);
         let (buffer, map) = host.upload_buffer(u64::from(SLOT_STRIDES_COUNT) * 4)?;
         // SAFETY: the fresh upload mapping holds SLOT_STRIDES_COUNT dwords.
         let data = unsafe { std::slice::from_raw_parts_mut(map.cast::<u32>(), SLOT_STRIDES_COUNT as usize) };
@@ -2623,7 +2623,7 @@ impl HostHeap {
     /// ([`TextureQueue::census`]).
     #[cfg(test)]
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
-        let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame);
+        let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame, max != 0);
         (if max == 0 { Vec::new() } else { due.order(max) }, census)
     }
 
@@ -2634,7 +2634,7 @@ impl HostHeap {
     /// the lock (the pass asked it slot by slot, under the lock each time);
     /// and the queue's counts ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due_known(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>, [u64; 6]) {
-        let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame);
+        let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame, max != 0);
         let (order, known) = if max == 0 { (Vec::new(), Vec::new()) } else { due.ordered(max) };
         (order, known, census)
     }
@@ -3096,7 +3096,7 @@ impl HostHeap {
             let i = index as usize;
             let tabled = self.tabled.get(i).map_or(0, |t| t.load(Relaxed));
             let last_frame = u64::from(tabled & !TABLED_READ);
-            if last_frame != 0 && frame.saturating_sub(last_frame.saturating_sub(1)) <= 4 {
+            if last_frame != 0 && frame.saturating_sub(last_frame.saturating_sub(1)) <= 240 {
                 continue;
             }
             let Some(slot) = self.kept.get(i) else { continue };
@@ -6722,7 +6722,10 @@ mod tests {
         assert_eq!(q.census(9)[2], 1);
         // The census made with the slots due is the census.
         for at in [0, 9, frame, u64::MAX] {
-            assert_eq!(q.due_and_census(at).1, q.census(at));
+            assert_eq!(q.due_and_census(at, true).1, q.census(at));
+            let (empty, counts) = q.due_and_census(at, false);
+            assert!(empty.again.is_empty() && empty.fresh.is_empty());
+            assert_eq!(counts, q.census(at));
         }
         q.done(17, w17);
         assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
@@ -6769,7 +6772,8 @@ mod tests {
         assert_eq!((c[2], c[5]), (1, 1));
         assert_eq!(c[4], 15, "the oldest is slot 2's write, not slot 1's");
         for at in [0, 12, 20] {
-            assert_eq!(q.due_and_census(at).1, q.census(at));
+            assert_eq!(q.due_and_census(at, true).1, q.census(at));
+            assert_eq!(q.due_and_census(at, false).1, q.census(at));
         }
     }
 
@@ -7178,14 +7182,14 @@ mod tests {
         q.recheck(31, w31, 5, (0x2000, 4096), 9, 0, 2);
         let w32 = write(&q, 32);
         q.later(32, w32, 2, 4);
-        let (order, known) = q.due_and_census(u64::MAX).0.ordered(100);
+        let (order, known) = q.due_and_census(u64::MAX, true).0.ordered(100);
         assert_eq!(order, q.due(u64::MAX, 100));
         assert_eq!(known.len(), order.len());
         for (&(index, _), knew) in order.iter().zip(&known) {
             assert_eq!(*knew, q.checked(index));
         }
         assert_eq!(known.iter().filter(|k| k.is_some()).count(), 1);
-        let (order, known) = q.due_and_census(u64::MAX).0.ordered(1);
+        let (order, known) = q.due_and_census(u64::MAX, true).0.ordered(1);
         assert_eq!((order.len(), known.len()), (1, 1));
     }
 

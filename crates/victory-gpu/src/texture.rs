@@ -1538,6 +1538,9 @@ impl Staging {
             waited(2, crate::watch::title_memory_reading)
         };
         if !committed(self.memory, size) {
+            // Release the title-memory read lock before the kernel-safe copy,
+            // hashing, and detiling so remaps do not block behind this refresh.
+            drop(_mapped);
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
@@ -1579,6 +1582,10 @@ impl Staging {
         // bytes come from the pages, through the copy. `_mapped` is held: no
         // view becomes one of those before the read in place below is done.)
         if through_copy() || !crate::watch::soft_runs(start, size).is_empty() {
+            // Kernel-safe copy path (`with_title` -> `copy_mapped`) does not
+            // read title memory in place; release `_mapped` before copying and
+            // detiling to avoid blocking the runtime remapper.
+            drop(_mapped);
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]

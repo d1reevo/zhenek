@@ -553,12 +553,9 @@ const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
 /// How many workers may make pipelines at once that are known to take long
-/// and that no draw has asked for: a quarter of them. On a fresh cache (a
-/// change of the translator or the driver) the early list begins with
-/// programs that take tens of seconds each: all 16 workers were in them
-/// through the whole of the title's loading, 97 pipelines made in 20 s, and
-/// the first minute and a half of the world ran at 0.5 to 1.6 s a frame,
-/// dropping up to 2,900 draws a frame (run shaders-1).
+/// and that no draw has asked for: half of the configured workers, leaving
+/// the other half immediately free for `requested` pipelines while draining
+/// `slow` faster during warm-up.
 /// `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as before.
 fn slow_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
@@ -566,9 +563,19 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            (configured_worker_count() / 2).max(1)
         }
     })
+}
+
+fn configured_worker_count() -> usize {
+    worker_count_for(
+        std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok()),
+        std::thread::available_parallelism().map_or(2, |n| n.get()),
+        crate::residency::limited_host_ram(),
+    )
 }
 
 struct Queue {
@@ -699,14 +706,8 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count_for(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-            crate::residency::limited_host_ram(),
-        );
-        tracing::info!(workers, "pipeline workers");
+        let workers = configured_worker_count();
+        tracing::info!(workers, slow_limit = slow_limit(), "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;

@@ -3143,16 +3143,28 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
+        static FULL_STREAK: AtomicU64 = AtomicU64::new(0);
         let mut room = crate::resource::room(memory);
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
         // 400 MB past its line while the world loaded: run 193).
         let mut since_asked = 0u64;
-        if !room {
+        let full_streak = if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
-        }
+            FULL_STREAK.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            FULL_STREAK.store(0, Ordering::Relaxed);
+            0
+        };
+        let refuse_limit = if full_streak >= 3 {
+            64
+        } else if full_streak == 2 {
+            256
+        } else {
+            1024
+        };
         let mut refused = 0;
         let baking = crate::texture::BAKING.get();
         before(0, || {
@@ -3428,10 +3440,10 @@ impl State {
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
                         tells.tell(index, write, Told::Held(frame + most));
-                        if refused > 1024 {
+                        if refused > refuse_limit {
                             break;
                         }
-                    } else if refused > 256 {
+                    } else if refused > 256.min(refuse_limit) {
                         break;
                     }
                     continue;

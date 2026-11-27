@@ -69,11 +69,11 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
         Some([budget, used, ..]) if (ONE_GIB..=EIGHT_GIB).contains(&budget) => {
             // On 8 GB cards (DXGI budget ~5.5-7.1 GiB) never hoard 4 GiB of empty
-            // 64 MiB blocks: keep at most 4 (<78%), 2 (78-88%), or 0 (>=88%).
+            // blocks: keep at most 4 (<72%), 2 (72-80%), or 0 (>=80%).
             let pct = (u128::from(used) * 100) / u128::from(budget);
-            if !keep || pct >= 88 {
+            if !keep || pct >= 80 {
                 0
-            } else if pct >= 78 {
+            } else if pct >= 72 {
                 SPARE
             } else {
                 4
@@ -699,6 +699,18 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     }
 }
 
+/// Outcome of [`texture_capped`].
+pub(crate) enum PoolTexture {
+    /// Placed inside an existing or newly grown pool heap.
+    Placed(ID3D12Resource),
+    /// Not eligible for pooling (pool off, too large, or D3D12 refusal); caller
+    /// may fall back to a committed allocation.
+    NotPooled,
+    /// No existing pool heap had a fitting range and growing a new DXGI heap
+    /// was disallowed by the raw VRAM anti-paging ceiling.
+    GrowthBlocked,
+}
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -709,8 +721,28 @@ pub(crate) unsafe fn texture(
     desc: *const D3D12_RESOURCE_DESC,
     state: D3D12_RESOURCE_STATES,
 ) -> Option<ID3D12Resource> {
+    // SAFETY: caller upholds `desc` validity.
+    match unsafe { texture_capped(device, desc, state, || true) } {
+        PoolTexture::Placed(t) => Some(t),
+        PoolTexture::NotPooled | PoolTexture::GrowthBlocked => None,
+    }
+}
+
+/// Like [`texture`], but invokes `allow_grow` only when no existing pool block
+/// can fit the allocation (i.e. before calling `CreateHeap`). Returning `false`
+/// from `allow_grow` prevents new DXGI VRAM growth while still allowing reuse
+/// of already-allocated free holes inside existing pool heaps.
+///
+/// # Safety
+/// `desc` is a valid description.
+pub(crate) unsafe fn texture_capped(
+    device: &ID3D12Device,
+    desc: *const D3D12_RESOURCE_DESC,
+    state: D3D12_RESOURCE_STATES,
+    mut allow_grow: impl FnMut() -> bool,
+) -> PoolTexture {
     if !on() {
-        return None;
+        return PoolTexture::NotPooled;
     }
     // Small textures lie at multiples of 4 KiB where the host allows it
     // (the top mip is 64 KiB at most) and [`small_placement`] says so: 64 KiB
@@ -725,10 +757,20 @@ pub(crate) unsafe fn texture(
         info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     }
     if info.SizeInBytes == u64::MAX {
-        return None;
+        return PoolTexture::NotPooled;
     }
+    let ripe = Ripe::now();
+    let max_len = if ripe.ahead > 0 { TEXTURE_BLOCK } else { TEXTURE_BLOCK / 2 };
+    if info.SizeInBytes == 0 || info.SizeInBytes > max_len {
+        return PoolTexture::NotPooled;
+    }
+    let mut growth_blocked = false;
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let Some((piece, heap, again)) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), ripe, || {
+        if !allow_grow() {
+            growth_blocked = true;
+            return None;
+        }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: TEXTURE_BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -748,7 +790,9 @@ pub(crate) unsafe fn texture(
             return None;
         }
         heap
-    })?;
+    }) else {
+        return if growth_blocked { PoolTexture::GrowthBlocked } else { PoolTexture::NotPooled };
+    };
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -777,11 +821,11 @@ pub(crate) unsafe fn texture(
                     )
                 });
             }
-            Some(made)
+            PoolTexture::Placed(made)
         }
         _ => {
             lock(&TEXTURES).give(piece, now());
-            None
+            PoolTexture::NotPooled
         }
     }
 }
