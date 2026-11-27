@@ -191,6 +191,25 @@ fn air() -> f32 {
     })
 }
 
+/// Max luminance multiple `raise` allows `light[p]` (`was`) over `found`
+/// (`VICTORY_AMBIENT_MOST`, default `1.5`; `0` discards stale `light[p]` completely).
+fn parse_most_ratio(raw: &str) -> f32 {
+    raw.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(1.5)
+}
+
+fn most_ratio() -> f32 {
+    static MOST: OnceLock<f32> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_MOST")
+            .ok()
+            .map_or(1.5, |v| parse_most_ratio(&v))
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -327,8 +346,14 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    c = (any(isnan(c)) || any(isinf(c))) ? 0.0 : max(c, 0.0);
+    // Filter violet/magenta and neon-green fog garbage from uninitialized probes.
+    if (c.g < 0.7 * min(c.r, c.b) && max(c.r, c.b) > 0.01) c = 0.0;
+    if (c.b > 1.6 * c.g && c.b > c.r && c.b > 0.01) c = 0.0;
+    if (c.g > 1.35 * max(c.r, c.b) && c.g > 0.01) c = 0.0;
     float has = dot(c, LUMA);
-    if (has > cap) scattered[at] = c * (cap / has);
+    if (has > cap && has > 1e-6) c *= (cap / has);
+    scattered[at] = c;
 }
 #endif
 
@@ -461,6 +486,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    was = (any(isnan(was)) || any(isinf(was))) ? 0.0 : max(was, 0.0);
     // Magenta/violet garbage the probes' memory held (green far under red and
     // blue): dropped, as VIctory-Belobug-AMD does (ambient.rs, "Filter magenta
     // garbage probes"). Seen on RTX 50 series as a purple-blue glow on lit
@@ -470,11 +496,17 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // a faint violet by the line above. The sky's light keeps green above
     // 0.4x blue, sunsets keep blue low, so neither is touched.
     if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
-    // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
-    float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
+    // Neon-green/cyan probe garbage in shadows/windows.
+    if (was.g > 1.35 * max(was.r, was.b) && was.g > 0.01) was = 0.0;
+    // What the program left counts as far as it can be true (`most == 0`
+    // discards stale resolve memory entirely so 8x8 blocks never appear).
+    if (most <= 0.0) {
+        was = 0.0;
+    } else {
+        float top = max(dot(found, LUMA) * most, 1e-6);
+        float has = dot(was, LUMA);
+        was *= min(1.0, top / max(has, 1e-6));
+    }
     float3 now = max(was, found);
     light[p] = pack(now);
     if (once > 0.0) {
@@ -722,7 +754,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.depth_size[0];
     words[7] = views.depth_size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most_ratio().to_bits();
     words[10] = air().to_bits();
     words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
@@ -781,6 +813,10 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        assert_eq!(parse_most_ratio("0"), 0.0);
+        assert_eq!(parse_most_ratio("1.5"), 1.5);
+        assert_eq!(parse_most_ratio("-1"), 1.5);
+        assert_eq!(parse_most_ratio("nan"), 1.5);
     }
 
     #[test]

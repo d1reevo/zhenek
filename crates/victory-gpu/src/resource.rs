@@ -1801,7 +1801,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         let evicted_at = r.host.slot_evicted.load(Relaxed);
-        if evicted_at != 0 && crate::host::now_ms().saturating_sub(evicted_at) < 3_000 {
+        if evicted_at != 0 && crate::host::now_ms().saturating_sub(evicted_at) < 15_000 {
             r.host.slot_returned.store(true, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
@@ -1841,6 +1841,18 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
         Some(budget) => MAX_FLOOR.min(budget / 4),
         None => MAX_FLOOR,
     }
+}
+
+/// Fragmented free holes inside 64 MiB texture blocks cannot shrink DXGI
+/// process residency until an entire block empties, so cap how much
+/// [`pool::texture_room`] can offset `used` in hard safety/idle checks.
+fn vram_used_past_slack_for(used: u64, texture_room: u64, max_slack: u64) -> u64 {
+    used.saturating_sub(texture_room.min(max_slack))
+}
+
+#[cfg(windows)]
+fn vram_used_past_slack(used: u64, max_slack: u64) -> u64 {
+    vram_used_past_slack_for(used, crate::pool::texture_room(), max_slack)
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -2328,9 +2340,10 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
+    const MAX_IDLE_BLOCK_SLACK: u64 = 64 << 20;
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let used = vram_used_past_slack(used, MAX_IDLE_BLOCK_SLACK)
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
             crate::host::vram_keep_below(budget, used, room_line(budget))
@@ -2427,6 +2440,7 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    crate::pool::reclaim_rested();
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2487,7 +2501,7 @@ fn collect_slot_evict_candidates(
     if need == 0 {
         return None;
     }
-    let eff_idle = idle_ms.min(5_000).max(1_500);
+    let eff_idle = idle_ms.min(20_000).max(10_000);
     let mut candidates: Vec<(u64, usize, usize, u64)> = Vec::new();
     let mut raws: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for &at in all.iter() {
@@ -5045,6 +5059,14 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 90 % (768 MiB would be more than a tenth).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
         assert_eq!(line_for(0), 0);
+    }
+
+    #[test]
+    fn vram_used_caps_fragmented_block_slack() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(vram_used_past_slack_for(5_000 * MIB, 80 * MIB, 128 * MIB), 4_920 * MIB);
+        assert_eq!(vram_used_past_slack_for(6_100 * MIB, 1_100 * MIB, 128 * MIB), 5_972 * MIB);
+        assert_eq!(vram_used_past_slack_for(100 * MIB, 200 * MIB, 128 * MIB), 0);
     }
 
     /// The room kept for render targets goes once the world's targets are
