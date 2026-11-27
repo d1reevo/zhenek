@@ -1,25 +1,36 @@
 <div align="center">
 
-# VIctory on NVIDIA — RTX 5060 8 GB Edition
+# VIctory on NVIDIA — 8 GB VRAM Edition (RTX 60 / 70 Series)
 
-**Xbox Series → Windows D3D12 compatibility layer tuned for 8 GB NVIDIA RTX GPUs**  
-*Branch: `rtx5060-8gb-clean` · Native DLSS Super Resolution + DLSS Frame Generation (2x–6x)*
+**Xbox Series → Windows D3D12 compatibility layer tuned for mainstream 8 GB NVIDIA RTX GPUs (RTX 3060 / 3060 Ti / 3070 / 4060 / 4060 Ti / 4070 / 5060)**  
+*Branch: `rtx5060-8gb-clean` · Anti-paging 8 GB VRAM pool + Native DLSS Super Resolution & DLSS Frame Generation (2x–6x)*
 
 [![Branch](https://img.shields.io/badge/Branch-rtx5060--8gb--clean-2ea043?style=for-the-badge&logo=git&logoColor=white)](https://github.com/d1reevo/zhenek/tree/rtx5060-8gb-clean)
-[![GPU](https://img.shields.io/badge/Tested_GPU-RTX_5060_8_GB-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](#tested-hardware--verified-results)
+[![Target GPUs](https://img.shields.io/badge/Target-RTX_60%2F70_Series_8_GB-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](#why-this-fork-exists-for-8-gb-gpus)
+[![Tested GPU](https://img.shields.io/badge/Tested-RTX_5060_8_GB-5c9400?style=for-the-badge&logo=nvidia&logoColor=white)](#tested-hardware--verified-results)
 [![CPU](https://img.shields.io/badge/CPU-Ryzen_7_5700X-ED1C24?style=for-the-badge&logo=amd&logoColor=white)](#tested-hardware--verified-results)
 [![Language](https://img.shields.io/badge/Rust-1.88%2B-000000?style=for-the-badge&logo=rust&logoColor=white)](Cargo.toml)
 [![DirectX](https://img.shields.io/badge/API-Direct3D_12-0078D4?style=for-the-badge&logo=windows&logoColor=white)](#what-was-fixed-on-rtx5060-8gb-clean)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge)](LICENSE)
 
-[Verified Benchmarks](#tested-hardware--verified-results) · [8 GB VRAM Architecture](#what-was-fixed-on-rtx5060-8gb-clean) · [Build & Run](#build--run) · [Upstream & Credits](#credits--upstream)
+[Why 8 GB GPUs](#why-this-fork-exists-for-8-gb-gpus) · [Verified Benchmarks](#tested-hardware--verified-results) · [8 GB VRAM Architecture](#what-was-fixed-on-rtx5060-8gb-clean) · [Build & Run](#build--run) · [Upstream & Credits](#credits--upstream)
 
 </div>
 
 ---
 
 > [!IMPORTANT]
-> **Zero game assets included.** This repository contains **no** game files, binaries, keys, or proprietary assets. You must supply your own legally obtained Xbox Series v1.0.2.1 build (`game_scarlett_master.exe`). Not affiliated with or endorsed by the title's developer/publisher or NVIDIA. See [docs/asset-policy.md](docs/asset-policy.md).
+> **Zero game assets included.** This repository contains **no** game files, binaries, keys, screenshots, or proprietary assets. You must supply your own legally obtained Xbox Series v1.0.2.1 build (`game_scarlett_master.exe`). Not affiliated with or endorsed by the title's developer/publisher or NVIDIA. See [docs/asset-policy.md](docs/asset-policy.md).
+
+---
+
+## Why This Fork Exists (for 8 GB GPUs)
+
+Most 8 GB NVIDIA **60- and 70-series cards** (`RTX 3060 8 GB`, `3060 Ti`, `3070`, `3070 Ti`, `4060`, `4060 Ti 8 GB`, `4070` mobile/desktop, `5060 8 GB`) hit two walls in stock builds:
+1. **WDDM shared-RAM overflow (`GPU = 100–400+ ms`)** once DXGI VRAM crosses ~95%, causing single-digit FPS and stuttering.
+2. **Black character faces / missing albedo textures** when aggressive slot eviction or incomplete mip allocations block bindless texture uploads.
+
+This branch defaults to the **`series-s` profile** (720p internal + DLSS Quality + optional DLSS Frame Generation) and caps speculative VRAM growth at **84%**, reusing pool holes (`>= 64 MiB`) up to **93%** so 8 GB cards keep textures sharp without spilling over PCIe into system RAM.
 
 ---
 
