@@ -4808,7 +4808,7 @@ impl<'a> Lower<'a> {
         let StageIo::Cs(cs) = self.x.native.io else {
             return;
         };
-        if !PAIRED.get() || !lds_init_hoist_on() {
+        if !(PAIRED.get() || self.halves.is_some()) || !lds_init_hoist_on() {
             return;
         }
         let inits = lds_init_hoists(self.x.p, cs.lds_bytes() / 4);

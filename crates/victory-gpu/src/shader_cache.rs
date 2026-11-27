@@ -79,6 +79,7 @@ fn build() -> [u8; 32] {
             "VICTORY_THREAD_TICKET",
             "VICTORY_DESCRIPTOR_REMAP",
             "VICTORY_WATER_LIGHT",
+            "VICTORY_WAVE_LOOP_SKIPS",
             "VICTORY_WAVE_PAIRS_FP32",
             "VICTORY_LDS_INIT_HOIST",
         ] {
@@ -133,13 +134,12 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| {
-        let paired_water = crate::pipeline::water_light_on()
+        let is_water = crate::pipeline::water_light_on()
             && victory_shader::emit::host_settings()[0] == 32
             && crate::pipeline::water_light_hash(&blake3::hash(c).to_hex()[..16]);
-        let made = victory_shader::emit::with_wave_pairs(paired_water, || victory_shader::emit::translate(c))
-            .map_err(|e| e.to_string());
-        if paired_water && made.is_ok() {
-            tracing::info!("water tile lighting translated with paired Wave64 on Wave32");
+        let made = victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        if is_water && made.is_ok() {
+            tracing::info!("water tile lighting translated for Wave32 (widen + loops_kept + LDS hoist + ticket)");
         }
         made
     };
