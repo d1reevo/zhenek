@@ -1220,18 +1220,31 @@ mod host {
             Some(self.mouse)
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+            let mut pad = if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+                None
+            } else {
+                let mut state = XINPUT_STATE::default();
+                // SAFETY: room for the state.
+                if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
+                    self.empty_until[slot] = None;
+                    Some(convert(&state.Gamepad))
+                } else {
+                    self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                    None
+                }
+            };
+            // Native Sony DualShock 4 / DualSense HID support on slot 0 (USB & Bluetooth,
+            // works without DS4Windows and even if an idle synthetic XInput pad occupies slot 0).
+            if slot == 0
+                && let Some(hid_state) = hid_pad::poll()
+            {
+                let active = if focused() { hid_state } else { PadState::default() };
+                pad = Some(match pad {
+                    Some(xpad) => super::merged(xpad, active),
+                    None => active,
+                });
             }
-            let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
-                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
-            }
-            self.empty_until[slot] = None;
-            #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = pad?;
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1434,6 +1447,437 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    /// Native Win32 HID support for Sony DualShock 4 (USB & Bluetooth) and
+    /// DualSense / DualSense Edge controllers, without needing DS4Windows or
+    /// ViGEm. Discovers Sony HID device paths via `GetRawInputDeviceList` +
+    /// `GetRawInputDeviceInfoW(RIDI_DEVICENAME)` and reads input reports
+    /// directly via `CreateFileW(..., FILE_SHARE_READ | FILE_SHARE_WRITE)` +
+    /// `ReadFile`, which works reliably even while Steam is running.
+    mod hid_pad {
+        use std::ffi::c_void;
+        use std::mem::size_of;
+        use std::ptr::{null, null_mut};
+        use std::sync::{LazyLock, Mutex, Once, PoisonError};
+        use std::time::Duration;
+
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+        };
+        use windows_sys::Win32::UI::Input::{
+            GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RID_DEVICE_INFO,
+            RIDI_DEVICEINFO, RIDI_DEVICENAME, RIM_TYPEHID,
+        };
+
+        use super::*;
+
+        const SONY_VID: u32 = 0x054C;
+        const DS4_V1_PID: u32 = 0x05C4;
+        const DS4_V2_PID: u32 = 0x09CC;
+        const DS4_DONGLE_PID: u32 = 0x0BA0;
+        const DUALSENSE_PID: u32 = 0x0CE6;
+        const DUALSENSE_EDGE_PID: u32 = 0x0DF2;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Kind {
+            DualShock4,
+            DualSense,
+        }
+
+        fn classify(vid: u32, pid: u32) -> Option<Kind> {
+            if vid != SONY_VID {
+                return None;
+            }
+            match pid {
+                DS4_V1_PID | DS4_V2_PID | DS4_DONGLE_PID => Some(Kind::DualShock4),
+                DUALSENSE_PID | DUALSENSE_EDGE_PID => Some(Kind::DualSense),
+                _ => None,
+            }
+        }
+
+        fn kind_name(kind: Kind) -> &'static str {
+            match kind {
+                Kind::DualShock4 => "DualShock 4",
+                Kind::DualSense => "DualSense",
+            }
+        }
+
+        #[derive(Default)]
+        struct Shared {
+            connected: bool,
+            state: PadState,
+        }
+
+        static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| Mutex::new(Shared::default()));
+        static STARTED: Once = Once::new();
+
+        pub(super) fn poll() -> Option<PadState> {
+            STARTED.call_once(|| {
+                let _ = std::thread::Builder::new()
+                    .name("victory-hid-pad".into())
+                    .spawn(run_loop);
+            });
+            let shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+            shared.connected.then_some(shared.state)
+        }
+
+        struct FoundDevice {
+            kind: Kind,
+            vid: u32,
+            pid: u32,
+            path_w: Vec<u16>,
+        }
+
+        fn query_sony_device(handle: HANDLE) -> Option<FoundDevice> {
+            let mut info: RID_DEVICE_INFO = unsafe { std::mem::zeroed() };
+            info.cbSize = size_of::<RID_DEVICE_INFO>() as u32;
+            let mut size = info.cbSize;
+            // SAFETY: `info` has `cbSize` set and matches `RID_DEVICE_INFO`.
+            let got = unsafe {
+                GetRawInputDeviceInfoW(
+                    handle,
+                    RIDI_DEVICEINFO,
+                    (&mut info as *mut RID_DEVICE_INFO).cast::<c_void>(),
+                    &mut size,
+                )
+            };
+            if got == u32::MAX || info.dwType != RIM_TYPEHID {
+                return None;
+            }
+            // SAFETY: `dwType == RIM_TYPEHID`, so `info.Anonymous.hid` is active.
+            let hid = unsafe { info.Anonymous.hid };
+            let kind = classify(hid.dwVendorId, hid.dwProductId)?;
+
+            let mut chars: u32 = 0;
+            // SAFETY: query required character count for `RIDI_DEVICENAME`.
+            let rc = unsafe {
+                GetRawInputDeviceInfoW(handle, RIDI_DEVICENAME, null_mut(), &mut chars)
+            };
+            if rc == u32::MAX || chars == 0 {
+                return None;
+            }
+            let mut path_w = vec![0u16; chars as usize + 1];
+            let mut buf_chars = chars;
+            // SAFETY: `path_w` holds `buf_chars` UTF-16 code units.
+            let rc = unsafe {
+                GetRawInputDeviceInfoW(
+                    handle,
+                    RIDI_DEVICENAME,
+                    path_w.as_mut_ptr().cast::<c_void>(),
+                    &mut buf_chars,
+                )
+            };
+            if rc == u32::MAX {
+                return None;
+            }
+            if !path_w.contains(&0) {
+                path_w.push(0);
+            }
+            Some(FoundDevice {
+                kind,
+                vid: hid.dwVendorId,
+                pid: hid.dwProductId,
+                path_w,
+            })
+        }
+
+        fn find_sony_device() -> Option<FoundDevice> {
+            let mut count: u32 = 0;
+            // SAFETY: query count only.
+            let rc = unsafe {
+                GetRawInputDeviceList(
+                    null_mut(),
+                    &mut count,
+                    size_of::<RAWINPUTDEVICELIST>() as u32,
+                )
+            };
+            if rc == u32::MAX || count == 0 {
+                return None;
+            }
+            let mut list = vec![
+                RAWINPUTDEVICELIST {
+                    hDevice: null_mut(),
+                    dwType: 0,
+                };
+                count as usize
+            ];
+            // SAFETY: `list` holds `count` elements.
+            let got = unsafe {
+                GetRawInputDeviceList(
+                    list.as_mut_ptr(),
+                    &mut count,
+                    size_of::<RAWINPUTDEVICELIST>() as u32,
+                )
+            };
+            if got == u32::MAX {
+                return None;
+            }
+            for dev in list.into_iter().take(got as usize) {
+                if dev.dwType == RIM_TYPEHID
+                    && let Some(found) = query_sony_device(dev.hDevice)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        fn run_loop() {
+            loop {
+                let Some(dev) = find_sony_device() else {
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                };
+                // SAFETY: `dev.path_w` is NUL-terminated UTF-16 device path.
+                let handle = unsafe {
+                    CreateFileW(
+                        dev.path_w.as_ptr(),
+                        GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        null(),
+                        OPEN_EXISTING,
+                        0,
+                        null_mut(),
+                    )
+                };
+                if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                tracing::info!(
+                    kind = kind_name(dev.kind),
+                    vid = format_args!("{:04X}", dev.vid),
+                    pid = format_args!("{:04X}", dev.pid),
+                    "Sony HID gamepad connected"
+                );
+                {
+                    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+                    shared.connected = true;
+                    shared.state = PadState::default();
+                }
+
+                // 128 bytes fits USB (64B) and Bluetooth (78B) DS4/DualSense input reports.
+                let mut buf = [0u8; 128];
+                let mut logged_active = false;
+                loop {
+                    let mut read: u32 = 0;
+                    // SAFETY: `handle` is open and `buf` holds 128 writable bytes.
+                    let ok = unsafe {
+                        ReadFile(
+                            handle,
+                            buf.as_mut_ptr(),
+                            buf.len() as u32,
+                            &mut read,
+                            null_mut(),
+                        )
+                    };
+                    if ok == 0 || read == 0 {
+                        break;
+                    }
+                    let report = &buf[..read as usize];
+                    let parsed = match dev.kind {
+                        Kind::DualShock4 => parse_ds4(report),
+                        Kind::DualSense => parse_dualsense(report),
+                    };
+                    if let Some(state) = parsed {
+                        if !logged_active {
+                            logged_active = true;
+                            tracing::info!(
+                                kind = kind_name(dev.kind),
+                                report_bytes = read,
+                                report_id = format_args!("0x{:02X}", report[0]),
+                                "Sony HID gamepad reports active"
+                            );
+                        }
+                        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+                        shared.state = state;
+                    }
+                }
+
+                // SAFETY: valid handle returned by `CreateFileW`.
+                unsafe { CloseHandle(handle) };
+                {
+                    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+                    shared.connected = false;
+                    shared.state = PadState::default();
+                }
+                tracing::info!(
+                    kind = kind_name(dev.kind),
+                    vid = format_args!("{:04X}", dev.vid),
+                    pid = format_args!("{:04X}", dev.pid),
+                    "Sony HID gamepad disconnected"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+
+        fn axis_x(v: u8) -> f32 {
+            if (127..=128).contains(&v) {
+                return 0.0;
+            }
+            ((f32::from(v) - 127.5) / 127.5).clamp(-1.0, 1.0)
+        }
+
+        fn axis_y(v: u8) -> f32 {
+            -axis_x(v)
+        }
+
+        fn decode_dpad(hat: u8) -> u32 {
+            match hat & 0x0F {
+                0 => UP,
+                1 => UP | RIGHT,
+                2 => RIGHT,
+                3 => DOWN | RIGHT,
+                4 => DOWN,
+                5 => DOWN | LEFT,
+                6 => LEFT,
+                7 => UP | LEFT,
+                _ => 0,
+            }
+        }
+
+        fn decode_common_buttons(dpad_face: u8, misc: u8, misc2: u8) -> u32 {
+            let mut buttons = decode_dpad(dpad_face);
+            if dpad_face & 0x10 != 0 {
+                buttons |= X; // Square
+            }
+            if dpad_face & 0x20 != 0 {
+                buttons |= A; // Cross
+            }
+            if dpad_face & 0x40 != 0 {
+                buttons |= B; // Circle
+            }
+            if dpad_face & 0x80 != 0 {
+                buttons |= Y; // Triangle
+            }
+            if misc & 0x01 != 0 {
+                buttons |= LEFT_SHOULDER; // L1
+            }
+            if misc & 0x02 != 0 {
+                buttons |= RIGHT_SHOULDER; // R1
+            }
+            if misc & 0x10 != 0 || misc2 & 0x02 != 0 {
+                buttons |= VIEW; // Share / Create or Touchpad click
+            }
+            if misc & 0x20 != 0 {
+                buttons |= MENU; // Options
+            }
+            if misc & 0x40 != 0 {
+                buttons |= LEFT_STICK; // L3
+            }
+            if misc & 0x80 != 0 {
+                buttons |= RIGHT_STICK; // R3
+            }
+            buttons
+        }
+
+        /// Parses a Sony DualShock 4 HID input report (USB `0x01` or Bluetooth `0x11`).
+        pub(super) fn parse_ds4(report: &[u8]) -> Option<PadState> {
+            let base = match *report.first()? {
+                0x01 if report.len() >= 10 => 1,
+                0x11 if report.len() >= 12 => 3,
+                _ => return None,
+            };
+            let lx = report[base];
+            let ly = report[base + 1];
+            let rx = report[base + 2];
+            let ry = report[base + 3];
+            let dpad_face = report[base + 4];
+            let misc = report[base + 5];
+            let misc2 = report[base + 6];
+            let l2 = report[base + 7];
+            let r2 = report[base + 8];
+            let mut left_trigger = f32::from(l2) / 255.0;
+            let mut right_trigger = f32::from(r2) / 255.0;
+            if left_trigger == 0.0 && misc & 0x04 != 0 {
+                left_trigger = 1.0;
+            }
+            if right_trigger == 0.0 && misc & 0x08 != 0 {
+                right_trigger = 1.0;
+            }
+            Some(PadState {
+                buttons: decode_common_buttons(dpad_face, misc, misc2),
+                left_trigger,
+                right_trigger,
+                left_x: axis_x(lx),
+                left_y: axis_y(ly),
+                right_x: axis_x(rx),
+                right_y: axis_y(ry),
+            })
+        }
+
+        /// Parses a Sony DualSense / DualSense Edge HID input report
+        /// (USB `0x01`, Bluetooth full `0x31`, or Bluetooth minimal `0x01`).
+        pub(super) fn parse_dualsense(report: &[u8]) -> Option<PadState> {
+            match *report.first()? {
+                0x01 if report.len() == 10 => parse_ds4(report),
+                0x01 if report.len() >= 11 => Some(parse_dualsense_at(report, 1)),
+                0x31 if report.len() >= 12 => Some(parse_dualsense_at(report, 2)),
+                _ => None,
+            }
+        }
+
+        fn parse_dualsense_at(report: &[u8], base: usize) -> PadState {
+            let lx = report[base];
+            let ly = report[base + 1];
+            let rx = report[base + 2];
+            let ry = report[base + 3];
+            let l2 = report[base + 4];
+            let r2 = report[base + 5];
+            let dpad_face = report[base + 7];
+            let misc = report[base + 8];
+            let misc2 = report[base + 9];
+            let mut left_trigger = f32::from(l2) / 255.0;
+            let mut right_trigger = f32::from(r2) / 255.0;
+            if left_trigger == 0.0 && misc & 0x04 != 0 {
+                left_trigger = 1.0;
+            }
+            if right_trigger == 0.0 && misc & 0x08 != 0 {
+                right_trigger = 1.0;
+            }
+            PadState {
+                buttons: decode_common_buttons(dpad_face, misc, misc2),
+                left_trigger,
+                right_trigger,
+                left_x: axis_x(lx),
+                left_y: axis_y(ly),
+                right_x: axis_x(rx),
+                right_y: axis_y(ry),
+            }
+        }
+    }
+
+    #[test]
+    fn ds4_usb_and_bt_reports_convert_to_console_pads() {
+        let usb = [0x01u8, 0, 0, 255, 255, 0x01 | 0x20 | 0x80, 0x01 | 0x20 | 0x80, 0x02, 255, 128];
+        let state = hid_pad::parse_ds4(&usb).expect("valid ds4 usb");
+        assert_eq!(state.buttons, UP | RIGHT | A | Y | LEFT_SHOULDER | MENU | RIGHT_STICK | VIEW);
+        assert_eq!((state.left_x, state.left_y, state.right_x, state.right_y), (-1.0, 1.0, 1.0, -1.0));
+        assert_eq!(state.left_trigger, 1.0);
+        assert!((state.right_trigger - 128.0 / 255.0).abs() < 1e-4);
+
+        let bt = [0x11u8, 0xC0, 0x00, 128, 127, 128, 128, 0x08 | 0x40, 0x10, 0x00, 0, 255];
+        let state = hid_pad::parse_ds4(&bt).expect("valid ds4 bt");
+        assert_eq!(state.buttons, B | VIEW);
+        assert_eq!((state.left_x, state.left_y, state.right_x, state.right_y), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!((state.left_trigger, state.right_trigger), (0.0, 1.0));
+    }
+
+    #[test]
+    fn dualsense_usb_and_bt_reports_convert_to_console_pads() {
+        let usb = [0x01u8, 255, 0, 128, 128, 255, 0, 0x00, 0x06 | 0x10, 0x02 | 0x40, 0x00];
+        let state = hid_pad::parse_dualsense(&usb).expect("valid dualsense usb");
+        assert_eq!(state.buttons, LEFT | X | RIGHT_SHOULDER | LEFT_STICK);
+        assert_eq!((state.left_x, state.left_y, state.left_trigger, state.right_trigger), (1.0, 1.0, 1.0, 0.0));
+
+        let bt = [0x31u8, 0x02, 128, 255, 0, 128, 0, 255, 0x00, 0x04 | 0x20, 0x20, 0x00];
+        let state = hid_pad::parse_dualsense(&bt).expect("valid dualsense bt");
+        assert_eq!(state.buttons, DOWN | A | MENU);
+        assert_eq!((state.left_y, state.right_x, state.right_trigger), (-1.0, -1.0, 1.0));
     }
 
     #[test]
