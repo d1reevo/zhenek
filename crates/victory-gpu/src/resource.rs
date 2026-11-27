@@ -1468,6 +1468,27 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive by an owned reference ([`alias_of`]); the
+/// reference is let go when this is dropped (fxceless/victory-fork PR #1336,
+/// VIctory-NVIDIA PR #25).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1496,8 +1517,28 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// all zeros from a first stage that held light (run 88).
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
+/// The texture is pinned under the table's lock and handed back held: once
+/// the lock is let go the title can drop its last reference, and the
+/// caller's alias copy still needs it (use-after-free, or a copy from the
+/// next texture at that address). One already being released is not
+/// returned (fxceless/victory-fork PR #1336, VIctory-NVIDIA PR #25).
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
+    alias_with(this, |other| crate::object::add_ref_alive(other).then(|| Held(other))).flatten()
+}
+
+/// Whether [`alias_of`] would find a texture for `this`, for callers that
+/// only ask: nothing is pinned, so none of them can end up dropping the
+/// texture's last reference.
+#[cfg(windows)]
+pub(crate) fn is_aliased(this: This) -> bool {
+    alias_with(this, |_| ()).is_some()
+}
+
+/// The lookup behind [`alias_of`]: `found` runs on the texture while the
+/// table's lock is still held.
+#[cfg(windows)]
+fn alias_with<R>(this: This, found: impl FnOnce(This) -> R) -> Option<R> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1558,7 +1599,8 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    // (Still under `targets`: a texture leaves the table before it is freed.)
+    same.then(|| found(other))
 }
 
 /// Says (once per kind of pair, at most 64 lines) that the texture the
@@ -1709,7 +1751,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if shape_fits && r.host.placed.load(Relaxed) && held_only() && !is_aliased(this) {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
