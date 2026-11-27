@@ -933,3 +933,29 @@ fn lds_accesses_after_the_last_plain_write_need_no_meeting() {
     assert_eq!(unstable.iter().map(|x| x.0).collect::<Vec<_>>(), ["ds_read_b32"]);
     assert!(unordered[0].1 > 0x10, "the read after the barrier");
 }
+
+#[test]
+fn lds_start_finds_water_tile_first_constant_write2() {
+    let words = [
+        0x7D86_0000, // v_cmp_le_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E0C_02C1, // v_mov_b32 v6, -1
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0xD838_0100,
+        0x0006_0505, // ds_write2_b32 v5, v5, v6 offset1:1
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0xD81C_0004,
+        0x0000_0005, // ds_min_u32 v5, v0 offset:4
+        0xD8D8_0004,
+        0x0700_0005, // ds_read_b32 v7, v5 offset:4
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut native = native_of(&words, true, 64);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert_eq!(lower::lds_start(&p), [(0, 0), (1, u32::MAX)]);
+}

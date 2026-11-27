@@ -338,6 +338,8 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// With `split_lds`: whether [`Self::lds_start`] has already been emitted in the entry block.
+    lds_started: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -1258,6 +1260,112 @@ mod lds_regions;
 use lds_regions::lds_init_hoist_on;
 pub(super) use lds_regions::lds_init_hoists;
 
+/// The start of a console program's LDS as its own first store leaves it: (dword, value) of
+/// the plain store of constants at a constant address (`ds_write_b32`, `ds_write2_b32` of what
+/// `v_mov_b32` moved there) that stands before every other LDS access of the program. Empty
+/// without such a store.
+pub(super) fn lds_start(p: &Program) -> Vec<(u32, u32)> {
+    let lds = |i: &Inst| {
+        matches!(i.fields, Fields::Ds { gds: false, .. })
+            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+    };
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        index[b] = n;
+    }
+    let with: Vec<usize> = order.iter().copied().filter(|&b| p.blocks[b].insts.iter().any(lds)).collect();
+    let Some(&first) = with.first() else {
+        return Vec::new();
+    };
+    // before every other access: its block is the first with one and dominates the others
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let after_first = |mut b: usize| loop {
+        if b == first {
+            break true;
+        }
+        if idom[b] == b || idom[b] == usize::MAX {
+            break false;
+        }
+        b = idom[b];
+    };
+    if !with.iter().all(|&b| after_first(b)) {
+        return Vec::new();
+    }
+    let Some(inst) = p.blocks[first].insts.iter().find(|i| lds(i)) else {
+        return Vec::new();
+    };
+    let Fields::Ds {
+        addr: Some(Operand::Vector { reg: addr, .. }),
+        data,
+        offset0,
+        offset1,
+        ..
+    } = &inst.fields
+    else {
+        return Vec::new();
+    };
+    // (byte offsets as [`Lower::ds`] takes them)
+    let bytes: Vec<u32> = match inst.name() {
+        "ds_write_b32" => vec![u32::from(*offset0) | u32::from(*offset1) << 8],
+        "ds_write2_b32" => vec![4 * u32::from(*offset0), 4 * u32::from(*offset1)],
+        _ => return Vec::new(),
+    };
+    // what a `v_mov_b32` of an inline constant or a literal put in the register
+    let constant = |reg: u8| -> Option<u32> {
+        let v = inst.read(Reg::V(reg))?;
+        let def = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        let Fields::Valu(valu) = &def.fields else {
+            return None;
+        };
+        if def.name() != "v_mov_b32" || valu.dpp.is_some() || valu.sdwa.is_some() {
+            return None;
+        }
+        match *valu.src.first()? {
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
+    };
+    let Some(base) = constant(*addr) else {
+        return Vec::new();
+    };
+    if bytes.len() != data.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (byte, op) in bytes.iter().zip(data) {
+        let Operand::Vector { reg, .. } = *op else {
+            return Vec::new();
+        };
+        let (Some(value), at) = (constant(reg), base.wrapping_add(*byte)) else {
+            return Vec::new();
+        };
+        if at % 4 != 0 || at / 4 >= HOST_LDS_DWORDS {
+            return Vec::new();
+        }
+        out.push((at / 4, value));
+    }
+    out
+}
+
+/// `VICTORY_LDS_START=0`: a group's LDS starts as the host's memory is, as before
+/// ([`lds_start`]).
+fn lds_start_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_START.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_START").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`lds_start_on`], for its thread only.
+    pub(super) static TEST_LDS_START: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2038,6 +2146,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_started: false,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -4808,7 +4917,7 @@ impl<'a> Lower<'a> {
         let StageIo::Cs(cs) = self.x.native.io else {
             return;
         };
-        if !(PAIRED.get() || self.halves.is_some()) || !lds_init_hoist_on() {
+        if !PAIRED.get() || !lds_init_hoist_on() {
             return;
         }
         let inits = lds_init_hoists(self.x.p, cs.lds_bytes() / 4);
@@ -4823,6 +4932,32 @@ impl<'a> Lower<'a> {
             self.s.m.store(e, ptr, k);
         }
         self.group_sync(e);
+    }
+
+    /// Emits the program's own start of its LDS ([`lds_start`]) in the entry block.
+    /// The group barrier that stands before each LDS access (`split_lds`) comes after it for
+    /// every thread, so no thread's store lands on what the program wrote since.
+    fn lds_start(&mut self) {
+        if !self.split_lds || std::mem::replace(&mut self.lds_started, true) || !lds_start_on() {
+            return;
+        }
+        let StageIo::Cs(cs) = &self.x.native.io else {
+            return;
+        };
+        if cs.threads.iter().product::<u32>() != 64 {
+            return;
+        }
+        let own = cs.lds_bytes() / 4;
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in lds_start(self.x.p) {
+            if dword >= own {
+                continue;
+            }
+            let (k, x) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, k);
+            self.s.m.store(e, ptr, x);
+        }
     }
 
     /// A group barrier with an LDS fence in `block`.
@@ -5723,6 +5858,7 @@ impl<'a> Lower<'a> {
         if paired_lds.unwrap_or(self.s.lds_dwords) == 0 {
             return Err("LDS the program does not allocate");
         }
+        self.lds_start();
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         let index = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
