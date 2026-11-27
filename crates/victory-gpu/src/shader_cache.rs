@@ -80,6 +80,7 @@ fn build() -> [u8; 32] {
             "VICTORY_DESCRIPTOR_REMAP",
             "VICTORY_WATER_LIGHT",
             "VICTORY_LDS_START",
+            "VICTORY_WATER_TILE_SLOTS",
             "VICTORY_WAVE_LOOP_SKIPS",
             "VICTORY_WAVE_PAIRS_FP32",
             "VICTORY_LDS_INIT_HOIST",
