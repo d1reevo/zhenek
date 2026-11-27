@@ -1460,6 +1460,65 @@ pub(crate) fn make_waiting() {
     }
 }
 
+/// Finds descriptor slots in shader-visible view heaps that currently hold any
+/// of the host textures in `raws` (COM raw ptr -> title texture ptr), returning
+/// `(title_tex, heap_ptr, slot_index)` tuples for `VICTORY_SLOT_EVICT`.
+#[cfg(windows)]
+pub(crate) fn evictable_slots(
+    raws: &std::collections::HashMap<usize, usize>,
+    frame: u64,
+) -> std::collections::HashMap<usize, Vec<(usize, u32)>> {
+    let mut by_tex: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heap, live while `SHADER_HEAPS` read lock is held.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() {
+            continue;
+        }
+        let Some(Some(host)) = heap.host.get() else { continue };
+        for (tex, index) in host.slots_showing(raws, frame) {
+            by_tex.entry(tex).or_default().push((at, index));
+        }
+    }
+    by_tex
+}
+
+/// Nulls the given `(heap_ptr, slot_index)` host descriptors for `resource` and
+/// queues their handles into `WAITING` so [`make_waiting`] restores them if the
+/// texture is recreated later. Returns the number of slots evicted.
+#[cfg(windows)]
+pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> usize {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut evicted = 0usize;
+    let mut handles = Vec::new();
+    for &(at, index) in slots {
+        if !heaps.iter().any(|&(_, _, h)| h == at) {
+            continue;
+        }
+        // SAFETY: registered heap, live while `SHADER_HEAPS` read lock is held.
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(Some(host)) = heap.host.get() else { continue };
+        if host.evict_slot(index) {
+            evicted += 1;
+            if let Some(handle) = heap.handle(index) {
+                handles.push(handle);
+            }
+        }
+    }
+    drop(heaps);
+    if !handles.is_empty() {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = waiting.entry(resource).or_default();
+        for handle in handles {
+            if !entry.contains(&handle) {
+                entry.push(handle);
+            }
+        }
+    }
+    evicted
+}
+
 fn record(handle: u64, view: View) {
     if handle == 0 {
         return;

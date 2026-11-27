@@ -1304,6 +1304,11 @@ struct Hosted {
     wanted: std::sync::atomic::AtomicU32,
     /// The next host copy takes the place of one with fewer levels.
     grown: std::sync::atomic::AtomicBool,
+    /// Coarse ms timestamp when this texture's host copy was last evicted by
+    /// `VICTORY_SLOT_EVICT` (0: never).
+    slot_evicted: std::sync::atomic::AtomicU64,
+    /// Set if recreated within `PROTECT_MS` of slot eviction (thrash guard).
+    slot_returned: std::sync::atomic::AtomicBool,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1753,6 +1758,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
+        let evicted_at = r.host.slot_evicted.load(Relaxed);
+        if evicted_at != 0 && crate::host::now_ms().saturating_sub(evicted_at) < 3_000 {
+            r.host.slot_returned.store(true, Relaxed);
+        }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
@@ -1811,8 +1820,19 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
-        return filled < limit;
+    // `VICTORY_TEXTURE_BUDGET_MB` acts as an upper cap on title-filled texture
+    // copies without bypassing the live DXGI VRAM budget check (important on
+    // 8 GB cards when DXGI budget drops to ~5.5-6.0 GiB or Frame Gen needs headroom).
+    if let Some(limit) = limit
+        && filled >= limit
+    {
+        return false;
+    }
+    if let Some([budget, used, ..]) = memory
+        && budget > 0
+        && used.saturating_sub(crate::pool::texture_room()) >= budget / 100 * 95
+    {
+        return false;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if filled < floor {
@@ -2354,6 +2374,14 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    // Phase 1 of `VICTORY_SLOT_EVICT`: collect candidates while holding `TEXTURES`,
+    // then drop `all` BEFORE calling into `descriptor` (`SHADER_HEAPS`/`WAITING`)
+    // so `TEXTURES` and descriptor locks are NEVER nested (eliminates AB-BA deadlock).
+    let evict_plan = collect_slot_evict_candidates(&all, memory, idle_ms, IDLE_FRAMES);
+    drop(all);
+    if let Some((candidates, raws, need, used, budget)) = evict_plan {
+        slot_evict_run(candidates, raws, need, used, budget);
+    }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
@@ -2365,6 +2393,157 @@ pub(crate) fn let_go_idle() {
                 first.unwrap_or(0)
             )
         });
+    }
+}
+
+/// Opt-in eviction of idle slot-held textures under VRAM pressure (`VICTORY_SLOT_EVICT=1`).
+/// Controlled by `VICTORY_SLOT_EVICT_PERCENT` (default 85%) and `VICTORY_SLOT_EVICT_MB` (default 256).
+#[cfg(windows)]
+fn slot_evict_settings() -> Option<(u64, u64)> {
+    static SET: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        if !std::env::var_os("VICTORY_SLOT_EVICT").is_some_and(|v| v == "1") {
+            return None;
+        }
+        let pct = std::env::var("VICTORY_SLOT_EVICT_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(85)
+            .clamp(50, 98);
+        let cap_mb = std::env::var("VICTORY_SLOT_EVICT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            .clamp(16, 2048);
+        Some((pct, cap_mb << 20))
+    })
+}
+
+#[cfg(windows)]
+type SlotEvictPlan = (Vec<(u64, usize, usize, u64)>, std::collections::HashMap<usize, usize>, u64, u64, u64);
+
+#[cfg(windows)]
+fn collect_slot_evict_candidates(
+    all: &std::collections::BTreeSet<usize>,
+    video: Option<[u64; 4]>,
+    idle_ms: u64,
+    frames: u64,
+) -> Option<SlotEvictPlan> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    let (Some((percent, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
+        return None;
+    };
+    if budget == 0 {
+        return None;
+    }
+    let target = budget / 100 * percent;
+    if used < target {
+        return None;
+    }
+    let need = used.saturating_sub(budget / 100 * percent.saturating_sub(4)).min(cap);
+    if need == 0 {
+        return None;
+    }
+    let eff_idle = idle_ms.min(5_000).max(1_500);
+    let mut candidates: Vec<(u64, usize, usize, u64)> = Vec::new();
+    let mut raws: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &at in all.iter() {
+        // SAFETY: `all` holds `TEXTURES` guard; every entry is a live `Resource`.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) || r.host.slot_returned.load(Relaxed) {
+            continue;
+        }
+        let used_at = r.host.used.load(Relaxed);
+        if used_at == 0 || !crate::host::long_ago(used_at, eff_idle, frames) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) > 1
+        {
+            let raw = host.texture.as_raw() as usize;
+            candidates.push((used_at & 0xffff_ffff, at, raw, host.bytes));
+            raws.insert(raw, at);
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_unstable_by_key(|&(age, ..)| age);
+    Some((candidates, raws, need, used, budget))
+}
+
+#[cfg(windows)]
+fn slot_evict_run(
+    candidates: Vec<(u64, usize, usize, u64)>,
+    raws: std::collections::HashMap<usize, usize>,
+    need: u64,
+    used: u64,
+    budget: u64,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Phase 2 (NO `TEXTURES` lock held): find and null host descriptor slots.
+    let by_tex = crate::descriptor::evictable_slots(&raws, crate::frame::current());
+    let mut chosen: Vec<(usize, u64)> = Vec::new();
+    let (mut planned, mut slots_freed) = (0u64, 0usize);
+    for &(_, at, _, bytes) in &candidates {
+        if planned >= need {
+            break;
+        }
+        let Some(slots) = by_tex.get(&at) else { continue };
+        let n = crate::descriptor::evict_slots(at, slots);
+        if n == 0 {
+            continue;
+        }
+        slots_freed += n;
+        planned += bytes;
+        chosen.push((at, bytes));
+    }
+    if chosen.is_empty() {
+        return;
+    }
+    // Phase 3 (re-acquire `TEXTURES` with NO descriptor locks held): retire host copies.
+    let now = crate::host::now_ms();
+    let (mut freed, mut count) = (0u64, 0u64);
+    let all = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    for (at, bytes) in chosen {
+        if !all.contains(&at) {
+            continue;
+        }
+        // SAFETY: `at` is verified live inside `TEXTURES`.
+        let r = unsafe { &*(at as *const Resource) };
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made.as_ref().is_some_and(|(h, _)| std::sync::Arc::strong_count(h) == 1) {
+                crate::texture::unstage(at as This);
+                r.host.wanted.store(u32::MAX, Relaxed);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, _)) = gone {
+            r.host.gone.store(true, Relaxed);
+            r.host.slot_evicted.store(now, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            freed += bytes;
+            count += 1;
+            crate::host::retire(host);
+        }
+    }
+    drop(all);
+    if count > 0 {
+        tracing::info!(
+            evicted = count,
+            mib = freed >> 20,
+            slots = slots_freed,
+            used_mb = used >> 20,
+            budget_mb = budget >> 20,
+            "slot_evict: freed idle slot-held textures under VRAM pressure"
+        );
     }
 }
 
@@ -2932,6 +3111,8 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
+            slot_evicted: std::sync::atomic::AtomicU64::new(0),
+            slot_returned: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).

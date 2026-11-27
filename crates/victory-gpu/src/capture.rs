@@ -144,15 +144,24 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if folder().is_none() {
+        return false;
+    }
+    static SPARSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let sparse = *SPARSE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD_ALSO").is_some());
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
-    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    let before_world = !sparse
+        && world_on()
+        && n.is_multiple_of(16)
+        && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    let in_world =
+        !sparse && world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    (!sparse && n.is_power_of_two()) || listed(n) || before_world || in_world
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.

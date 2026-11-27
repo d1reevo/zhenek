@@ -3751,6 +3751,7 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        list.gpu_stamp("dispatch", self.pipeline, u64::from(x) * u64::from(y) * u64::from(z));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -4285,6 +4286,7 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.gpu_stamp("mesh", self.pipeline, u64::from(x));
                     self.mesh_scissor(list, true);
                     #[cfg(feature = "diagnostics")]
                     if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
@@ -4776,6 +4778,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.gpu_stamp("draw", self.pipeline, u64::from(count) * u64::from(instances));
             let frontend = if count == 3 && instances == 1 { self.native_frontend_viewport() } else { None };
             if let Some(viewport) = frontend {
                 viewports(list, &[viewport]);
@@ -4966,6 +4969,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.gpu_stamp("draw", self.pipeline, u64::from(indices) * u64::from(instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -5310,6 +5314,14 @@ impl State {
                 ));
                 list.hold_indirect();
             } else {
+                let indirect_kind = match kind {
+                    DRAW => "indirect draw",
+                    INDEXED => "indirect indexed",
+                    DISPATCH => "indirect dispatch",
+                    MESH => "indirect mesh",
+                    _ => "indirect",
+                };
+                list.gpu_stamp(indirect_kind, self.pipeline, u64::from(max));
                 if kind == MESH {
                     self.mesh_scissor(list, true);
                 }

@@ -64,7 +64,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    const ONE_GIB: u64 = 1 << 30;
+    const EIGHT_GIB: u64 = 8 << 30;
     match memory {
+        Some([budget, used, ..]) if (ONE_GIB..=EIGHT_GIB).contains(&budget) => {
+            // On 8 GB cards (DXGI budget ~5.5-7.1 GiB) never hoard 4 GiB of empty
+            // 64 MiB blocks: keep at most 4 (<78%), 2 (78-88%), or 0 (>=88%).
+            let pct = (u128::from(used) * 100) / u128::from(budget);
+            if !keep || pct >= 88 {
+                0
+            } else if pct >= 78 {
+                SPARE
+            } else {
+                4
+            }
+        }
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
     }

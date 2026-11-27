@@ -226,14 +226,45 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
 /// in a new block is a page fault for them until the block is mapped. The
 /// device losses of the night of 2026-11-25 were that (run n08: the fault
 /// lay in a texture made in the same tenth of a second, in a new block).
-fn wait_resident() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
+/// Residency wait policy (`VICTORY_WAIT_RESIDENT`):
+/// - `1` (default): wait for both VRAM and system-RAM allocations (safest);
+/// - `card` / `vram`: wait only for VRAM (`DEFAULT` / `GPU_UPLOAD`) allocations
+///   (`pool`, committed textures, `uav_buffer`, `mapped_card_buffer`), letting
+///   system-RAM `shared_buffer` and `upload_buffer` allocate resident directly
+///   without tens of thousands of synchronous `MakeResident` + copy-queue fence waits;
+/// - `0`: off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitResidentMode {
+    All,
+    CardOnly,
+    Off,
 }
 
-/// The flag memory is made with that [`resident`] waits for.
+fn wait_resident_mode() -> WaitResidentMode {
+    static MODE: OnceLock<WaitResidentMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_WAIT_RESIDENT").as_deref() {
+        Ok("0") => WaitResidentMode::Off,
+        Ok("card") | Ok("vram") => WaitResidentMode::CardOnly,
+        _ => WaitResidentMode::All,
+    })
+}
+
+fn wait_resident() -> bool {
+    wait_resident_mode() != WaitResidentMode::Off
+}
+
+fn wait_resident_host_ram() -> bool {
+    wait_resident_mode() == WaitResidentMode::All
+}
+
+/// The flag memory is made with that [`resident`] waits for (VRAM/card heaps).
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// The same flag for system-RAM upload/shared buffers (`All` mode only).
+fn not_resident_host_ram() -> D3D12_HEAP_FLAGS {
+    if wait_resident_host_ram() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
 /// A queue of its own that new memory is waited for with ([`mapped`]).
@@ -1296,6 +1327,8 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_TIME` (`crate::prof`): per-command GPU timestamps.
+    prof: Mutex<crate::prof::ListProf>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -4276,6 +4309,7 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                prof: Mutex::default(),
             })
         }
     }
@@ -6475,6 +6509,7 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        self.gpu_resolve();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6564,6 +6599,94 @@ impl HostList {
         false
     }
 
+    /// With `VICTORY_GPU_TIME`: stamps the GPU clock before a command on
+    /// sampled frames (one cached flag test when off).
+    pub(crate) fn gpu_stamp(&self, kind: &'static str, pipeline: usize, n: u64) {
+        if !crate::prof::on() {
+            return;
+        }
+        let mut p = self.prof.lock().unwrap_or_else(|e| e.into_inner());
+        if !p.decided {
+            p.decided = true;
+            p.frame = crate::frame::current();
+            p.sampled = crate::prof::sampled(p.frame);
+            if p.sampled && p.heap.is_none() {
+                p.heap = host().and_then(|h| crate::prof::make(&h.device));
+            }
+            p.sampled &= p.heap.is_some();
+        }
+        if !p.sampled {
+            return;
+        }
+        if p.keys.len() as u32 >= crate::prof::CAP - 1 {
+            crate::prof::OVER.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let name = if pipeline != 0 {
+            crate::pipeline::hashes_of(pipeline as crate::object::This)
+        } else {
+            String::new()
+        };
+        let at = p.keys.len() as u32;
+        if let Some((heap, _)) = &p.heap {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        }
+        p.keys.push(crate::prof::Key { kind, name, n });
+    }
+
+    /// With `VICTORY_GPU_TIME`, at close: the last stamp and the resolve.
+    fn gpu_resolve(&self) {
+        if !crate::prof::on() {
+            return;
+        }
+        let mut p = self.prof.lock().unwrap_or_else(|e| e.into_inner());
+        let count = p.keys.len() as u32;
+        if !p.sampled || count == 0 {
+            return;
+        }
+        if let Some((heap, back)) = &p.heap {
+            // SAFETY: an open list, our query heap and read-back buffer.
+            unsafe {
+                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+            }
+            p.resolved = count + 1;
+        }
+    }
+
+    /// With `VICTORY_GPU_TIME`, at reset (the list has run): reads the stamps.
+    fn gpu_land(&self) {
+        if !crate::prof::on() {
+            return;
+        }
+        let mut p = self.prof.lock().unwrap_or_else(|e| e.into_inner());
+        let (n, frame) = (p.resolved as usize, p.frame);
+        if let (true, Some((_, back))) = (n > 1, &p.heap) {
+            let mut data = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: n * 8 };
+            let stamps = unsafe {
+                if back.Map(0, Some(&range), Some(&mut data)).is_ok() {
+                    let s = std::slice::from_raw_parts(data.cast::<u64>(), n).to_vec();
+                    let empty = D3D12_RANGE { Begin: 0, End: 0 };
+                    back.Unmap(0, Some(&empty));
+                    Some(s)
+                } else {
+                    None
+                }
+            };
+            if let Some(stamps) = stamps {
+                // SAFETY: a plain query.
+                let frequency = host().map_or(1, |h| unsafe { h.queue.GetTimestampFrequency() }.unwrap_or(1));
+                crate::prof::land(frame, frequency, &p.keys, &stamps);
+            }
+        }
+        p.decided = false;
+        p.sampled = false;
+        p.resolved = 0;
+        p.keys.clear();
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
@@ -6576,6 +6699,7 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        self.gpu_land();
         self.upscale.store(0, Ordering::Relaxed);
         self.hudless.store(0, Ordering::Relaxed);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -9176,7 +9300,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    not_resident_host_ram(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9184,7 +9308,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    if wait_resident_host_ram() {
+                        resident(&self.device, b)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9843,10 +9969,8 @@ impl Host {
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
-            #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
-            #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
+            let read_now = crate::capture::wanted(frame)
+                || (cfg!(feature = "diagnostics") && crate::capture::listed(frame));
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -9936,7 +10060,6 @@ impl Host {
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
-            #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
                     if composed {
@@ -9971,8 +10094,6 @@ impl Host {
             };
             p.panel.draw(self, copy, &back, (width, height), format);
             p.menu.draw(self, copy, &back, (width, height), format);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
             if composed {
                 list.ResourceBarrier(&[transition(
                     &back,
@@ -10009,7 +10130,6 @@ impl Host {
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = flown;
-            #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
@@ -10289,7 +10409,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    not_resident_host_ram(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10297,8 +10417,10 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if wait_resident_host_ram() {
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };

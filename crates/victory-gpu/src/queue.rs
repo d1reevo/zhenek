@@ -908,7 +908,6 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -990,9 +989,10 @@ extern "system" fn present(
             }
         }
     }
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        #[cfg(feature = "diagnostics")]
         if crate::capture::listed(frame) {
             before_sync();
             crate::capture::dump_targets(frame);

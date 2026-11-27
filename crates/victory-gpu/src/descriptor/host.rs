@@ -1301,21 +1301,49 @@ impl Due {
     }
 
     /// [`Due::order`], and beside it what [`TextureQueue::checked`] said of
-    /// each when they were taken.
+    /// each when they were taken. Uses O(N) `select_nth_unstable_by` so a
+    /// large backlog only sorts the slots this pass actually serves.
     fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
+        if max == 0 {
+            return (Vec::new(), Vec::new());
+        }
         let Due { mut again, mut fresh } = self;
         // By the number of the write, counted over the run.
-        again.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-        fresh.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        let again_newest = |a: &(u64, u32, u64, Option<Checked>), b: &(u64, u32, u64, Option<Checked>)| b.2.cmp(&a.2);
+        let fresh_newest = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, again_newest);
+            again.truncate(max);
+        }
+        again.sort_unstable_by(again_newest);
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
         let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let take = max.saturating_sub(order.len()).min(fresh.len());
+        if take > 0 {
+            let new_count = take.div_ceil(2);
+            let old_count = take / 2;
+            if new_count < fresh.len() {
+                fresh.select_nth_unstable_by(new_count, fresh_newest);
+            }
+            let (newest, rest) = fresh.split_at_mut(new_count);
+            newest.sort_unstable_by(fresh_newest);
+            let oldest = if old_count > 0 {
+                let oldest_at = rest.len().saturating_sub(old_count);
+                if oldest_at > 0 {
+                    rest.select_nth_unstable_by(oldest_at, fresh_newest);
+                }
+                let slice = &mut rest[oldest_at..];
+                slice.sort_unstable_by(|a, b| fresh_newest(b, a));
+                slice
+            } else {
+                &mut rest[..0]
+            };
+            order.reserve(take);
+            for (pos, &entry) in newest.iter().enumerate() {
+                order.push((entry.1, entry.2));
+                if let Some(&old_entry) = oldest.get(pos) {
+                    order.push((old_entry.1, old_entry.2));
+                }
             }
         }
         order.truncate(max);
@@ -2670,6 +2698,53 @@ impl HostHeap {
         }
         self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// Title slots currently viewing any host texture in `raws` (COM raw pointer -> title texture),
+    /// skipping slots read through a table within the last 4 frames so active draws stay untouched.
+    pub(crate) fn slots_showing(
+        &self,
+        raws: &std::collections::HashMap<usize, usize>,
+        frame: u64,
+    ) -> Vec<(usize, u32)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::core::Interface;
+        if self.sampler || raws.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for index in 0..self.count {
+            let i = index as usize;
+            let tabled = self.tabled.get(i).map_or(0, |t| t.load(Relaxed));
+            let last_frame = u64::from(tabled & !TABLED_READ);
+            if last_frame != 0 && frame.saturating_sub(last_frame.saturating_sub(1)) <= 4 {
+                continue;
+            }
+            let Some(slot) = self.kept.get(i) else { continue };
+            let raw = {
+                let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().map(|r| r.as_raw() as usize)
+            };
+            if let Some(raw) = raw
+                && let Some(&title_tex) = raws.get(&raw)
+            {
+                out.push((title_tex, index));
+            }
+        }
+        out
+    }
+
+    /// Nulls host slot `index` under VRAM pressure (`VICTORY_SLOT_EVICT=1`) so
+    /// the host texture it keeps can be retired; returns true if the slot was
+    /// made and unmade.
+    pub(crate) fn evict_slot(&self, index: u32) -> bool {
+        let _made = self.made.lock(index);
+        if self.made.get(index).unwrap_or(0) == 0 {
+            return false;
+        }
+        self.away.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
+        self.unmake(index);
         true
     }
 

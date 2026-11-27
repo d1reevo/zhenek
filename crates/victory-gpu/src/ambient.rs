@@ -717,6 +717,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[10] = air().to_bits();
     words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
+    list.gpu_stamp("ambient", 0, 0);
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
     // these views need; buffers the list keeps.

@@ -459,6 +459,11 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+#[cfg(windows)]
+pub(crate) fn hashes_of(this: This) -> String {
+    host_pipeline(this).map_or_else(String::new, |p| p.name.clone())
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

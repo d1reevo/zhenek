@@ -59,8 +59,94 @@ pub fn init(default_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_writer(std::io::stderr),
+                .with_writer(Lines::new()),
         )
         .with(file)
         .try_init();
+}
+
+/// Async stderr writer for INFO and below (`VICTORY_LOG_SYNC=1` restores sync).
+/// Warnings and errors write synchronously so crash context always reaches disk.
+struct Lines(Option<std::sync::mpsc::Sender<Vec<u8>>>);
+
+impl Lines {
+    fn new() -> Self {
+        if std::env::var_os("VICTORY_LOG_SYNC").is_some_and(|v| v == "1") {
+            return Self(None);
+        }
+        let (to, from) = std::sync::mpsc::channel::<Vec<u8>>();
+        let spawned = std::thread::Builder::new()
+            .name("victory-log".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut batch = Vec::with_capacity(64 << 10);
+                while let Ok(line) = from.recv() {
+                    batch.extend_from_slice(&line);
+                    while batch.len() < 256 << 10 {
+                        match from.try_recv() {
+                            Ok(more) => batch.extend_from_slice(&more),
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = std::io::stderr().lock().write_all(&batch);
+                    batch.clear();
+                }
+            });
+        Self(spawned.ok().map(|_| to))
+    }
+}
+
+enum Line {
+    Queued(Vec<u8>, std::sync::mpsc::Sender<Vec<u8>>),
+    Now(std::io::Stderr),
+}
+
+impl std::io::Write for Line {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Line::Queued(line, _) => {
+                line.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            Line::Now(err) => err.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Line::Queued(..) => Ok(()),
+            Line::Now(err) => err.flush(),
+        }
+    }
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        if let Line::Queued(line, to) = self
+            && !line.is_empty()
+            && let Err(lost) = to.send(std::mem::take(line))
+        {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(&lost.0);
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Lines {
+    type Writer = Line;
+
+    fn make_writer(&'a self) -> Line {
+        match &self.0 {
+            Some(to) => Line::Queued(Vec::with_capacity(256), to.clone()),
+            None => Line::Now(std::io::stderr()),
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Line {
+        if *meta.level() <= tracing::Level::WARN {
+            Line::Now(std::io::stderr())
+        } else {
+            self.make_writer()
+        }
+    }
 }

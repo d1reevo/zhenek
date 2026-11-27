@@ -123,6 +123,36 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    // Opt-in empty-BVH RT compute skip (`VICTORY_SKIP_EMPTY_RT=1` or `all`):
+    // skips open-world BVH ray-trace/binning passes when the BVH builder is off,
+    // preserving ambient.rs hooks (`CS_ScreenProbes_TemporalResolve`,
+    // `CS_CacheScreenSpaceRadiance`, `CS_AccumulateLocalLightInscatteringVolume`,
+    // `CS_RayMiss_*`) and raster/tiled shadow passes.
+    static SKIP_EMPTY_RT: OnceLock<u8> = OnceLock::new();
+    let skip_empty_rt = *SKIP_EMPTY_RT.get_or_init(|| {
+        if std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
+            return 0;
+        }
+        match std::env::var("VICTORY_SKIP_EMPTY_RT").as_deref() {
+            Ok("1") | Ok("true") => 1,
+            Ok("all") => 2,
+            _ => 0,
+        }
+    });
+    if skip_empty_rt > 0 {
+        const EMPTY_RT_BASE: [&[u8]; 5] = [
+            b"CS_ScreenProbes_TraceRays",
+            b"CS_IrradianceCache_ShadowTrace",
+            b"CS_ScreenProbes_EvaluateRayRequests",
+            b"CS_ScreenProbes_GenerateRayBins",
+            b"CS_ScreenProbes_GenerateShaderBins",
+        ];
+        if EMPTY_RT_BASE.iter().any(|p| named(shaders, p))
+            || (skip_empty_rt >= 2 && named(shaders, b"CS_RaytraceVBuffer"))
+        {
+            return Some("empty-BVH ray-tracing compute pass (VICTORY_SKIP_EMPTY_RT), left out");
+        }
+    }
     None
 }
 

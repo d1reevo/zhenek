@@ -17,7 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 mod capture;
 #[cfg(windows)]
 mod compose;
@@ -65,6 +66,8 @@ mod pool;
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod prof;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
