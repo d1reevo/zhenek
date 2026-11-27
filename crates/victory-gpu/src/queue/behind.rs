@@ -571,6 +571,7 @@ impl Work for Job {
                 let met = wait.met();
                 let ahead = !met && crate::host::late_met_known(wait) == Some(true);
                 if !met && !ahead && !hosts().any(|list| crate::host::will_meet(list, wait)) {
+                    NOT_JOINED[0].fetch_add(1, Relaxed);
                     return Err(next);
                 }
                 // Met by a flight in the air: on a queue of its own the
@@ -581,17 +582,31 @@ impl Work for Job {
             }
             &Job::Wait(fence, value) => {
                 if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                    NOT_JOINED[1].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                let why = if count >= most {
+                    Some(2)
+                } else if lists.1.len() + runs.len() > most_lists {
+                    Some(3)
+                } else if !crate::host::joinable(hosts(), &runs) {
+                    Some(4)
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    NOT_JOINED[why].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => {
+                NOT_JOINED[5].fetch_add(1, Relaxed);
+                return Err(next);
+            }
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -722,6 +737,13 @@ const JOINED: usize = 10;
 /// Microseconds of [`Lane::unfold`] (the lists detached, new host lists
 /// given to the title's lists), under the line's lock and not in [`BUSY`].
 const UNFOLDING: usize = 11;
+
+/// Why the next entry of the line was not taken along with a submission
+/// ([`Job::take_along`]): a wait for a memory value not met, a fence wait not
+/// met, as many parts as joined at most, as many lists, the part not
+/// joinable (`crate::host::joinable`: a copy or a step of ours, or it reads
+/// what those before write), a present or other entry.
+static NOT_JOINED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -963,6 +985,18 @@ pub(super) fn line(frames: f64) {
         s[DRAINS] / frames,
         s[FORCED] / frames,
         s[JOINED] / frames
+    );
+    let n: Vec<f64> = NOT_JOINED.iter().map(|c| c.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "parts not taken along with the submission before them, per frame: {:.1} at a memory value wait not met, {:.1} at a \
+         fence wait not met, {:.1} at the most parts, {:.1} at the most lists, {:.1} not joinable (a copy or step of ours, or \
+         reading what those before write), {:.1} at a present or other",
+        n[0],
+        n[1],
+        n[2],
+        n[3],
+        n[4],
+        n[5],
     );
 }
 

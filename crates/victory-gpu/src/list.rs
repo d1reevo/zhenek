@@ -278,6 +278,13 @@ impl Detached {
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
+
+    /// Number of dynamic descriptor slots still held by this detached list
+    /// waiting for retirement.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pending_dynamic_slots(&self) -> u64 {
+        self._state.pending_dynamic_slots()
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

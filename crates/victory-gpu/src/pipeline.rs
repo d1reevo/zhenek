@@ -852,6 +852,8 @@ mod library;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
+pub(crate) use make::{water_light_hash, water_light_on};
+#[cfg(windows)]
 pub(crate) mod pieces;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline

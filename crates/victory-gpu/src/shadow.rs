@@ -127,6 +127,12 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<SentRuns>,
+    /// With [`masked_patch_now`]: the title's changed bytes under flights'
+    /// shader writes that go to the card's side as a masked patch (a
+    /// dword at a time, only the changed bytes stored) rather than as
+    /// copies of their runs ([`Shadow::merge_under_writes`]). Locked inside
+    /// `dirty`'s lock, `sent` inside it.
+    patch: Mutex<Patch>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
     /// The copy itself, set once it is in an `Arc` ([`carded`]): put on
@@ -709,6 +715,151 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
+    }
+    out
+}
+
+/// One dword of a masked patch ([`masked_patch_now`]): its byte offset in
+/// the copy (a multiple of 4), the bytes it sets (a mask of whole bytes),
+/// and their values (other bits 0).
+pub(crate) type PatchWord = [u32; 3];
+
+/// A copy's masked patch not yet sent ([`Card::patch`]): its words in the
+/// order they were made, and the byte runs they set.
+#[derive(Default)]
+struct Patch {
+    words: Vec<PatchWord>,
+    ranges: Vec<(usize, usize)>,
+}
+
+/// `VICTORY_MASKED_PATCH`: 0 off, 1 on (the default), 2 in turn (`alt`).
+pub(crate) fn masked_patch_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_MASKED_PATCH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        Ok("0") => 0,
+        _ => 1,
+    })
+}
+
+/// Set by `crate::host` once the patch's pipeline is made: without it
+/// nothing is patched (the merge gives up and the flights are settled, as
+/// without the switch).
+pub(crate) static PATCH_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a page of a copy in the card's memory whose changed runs under
+/// flights' shader writes are more than `VICTORY_MERGE_RUNS` leaves goes up
+/// as a masked patch instead of the merge giving up and the flights being
+/// settled (`VICTORY_MASKED_PATCH=1` by default, `0` off, `alt`: twenty
+/// seconds with, twenty without).
+pub(crate) fn masked_patch_now() -> bool {
+    if !PATCH_READY.load(Ordering::Relaxed) {
+        return false;
+    }
+    match masked_patch_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "title bytes under flights' shader writes past the merge's cap, from now (VICTORY_MASKED_PATCH=alt): {}",
+                    if on { "ON, sent as a masked patch" } else { "off, the flights are settled" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the last frame line, of the masked patch: pages patched (each a
+/// give-up of the merge, and a settle, before), dwords, dispatches, and
+/// submissions that sent one.
+pub(crate) static PATCHED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The words of a masked patch for the changed bytes `runs` (offset, bytes;
+/// in order, offsets in `title`) of a page at offset `at` of the copy,
+/// `title` holding the page's new bytes: appended to `out`, one word per
+/// dword touched.
+pub(crate) fn patch_words(at: usize, title: &[u8], runs: &[(usize, usize)], out: &mut Vec<PatchWord>) {
+    for &(r, m) in runs {
+        for k in r..r + m {
+            let offset = at + k;
+            let word = (offset & !3) as u32;
+            let lane = ((offset & 3) * 8) as u32;
+            let (mask, value) = (0xffu32 << lane, u32::from(title[k]) << lane);
+            match out.last_mut() {
+                Some(w) if w[0] == word => {
+                    w[1] |= mask;
+                    w[2] = (w[2] & !mask) | value;
+                }
+                _ => out.push([word, mask, value]),
+            }
+        }
+    }
+}
+
+/// `words` in the order of their offsets, those of one dword folded into
+/// one in the order they were made (a later word's bytes win): the patch's
+/// threads then never store the same dword.
+pub(crate) fn folded(mut words: Vec<PatchWord>) -> Vec<PatchWord> {
+    // Stable: words of one offset keep their order.
+    words.sort_by_key(|w| w[0]);
+    let mut out: Vec<PatchWord> = Vec::with_capacity(words.len());
+    for w in words {
+        match out.last_mut() {
+            Some(last) if last[0] == w[0] => {
+                last[2] = (last[2] & !w[1]) | (w[2] & w[1]);
+                last[1] |= w[1];
+            }
+            _ => out.push(w),
+        }
+    }
+    out
+}
+
+/// What the patch does to a dword (the shader's store, for the tests).
+#[cfg(test)]
+pub(crate) fn patched_word(old: u32, w: PatchWord) -> u32 {
+    (old & !w[1]) | (w[2] & w[1])
+}
+
+/// The masked patches of the copies in the card's memory, taken for the
+/// send numbered `sent_as` ([`card_dirty`]'s): per copy its words, folded
+/// ([`folded`]), and the byte runs they set, joined. With [`relay`] the runs
+/// are noted as sent, as the changed ranges are.
+pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Vec<(usize, usize)>)> {
+    let mut out = Vec::new();
+    if masked_patch_mode() == 0 {
+        return out;
+    }
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    for weak in carded.iter() {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let Some(c) = shadow.card.as_ref() else {
+            continue;
+        };
+        let taken = {
+            let _dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut patch = c.patch.lock().unwrap_or_else(|e| e.into_inner());
+            if patch.words.is_empty() {
+                continue;
+            }
+            let taken = std::mem::take(&mut *patch);
+            if relay() {
+                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.forget(fetched);
+                sent.note_joined(sent_as, joined(taken.ranges.clone()));
+            }
+            taken
+        };
+        out.push((shadow.clone(), folded(taken.words), joined(taken.ranges)));
     }
     out
 }
@@ -1868,6 +2019,67 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+}
+
+#[cfg(test)]
+mod masked_patch_tests {
+    use super::{PatchWord, folded, patch_words, patched_word};
+
+    /// The patch stores the title's changed bytes and nothing else: every
+    /// byte a "flight" wrote on the card between them stays, however many
+    /// runs there are and wherever they fall in their dwords.
+    #[test]
+    fn the_patch_stores_only_the_changed_bytes() {
+        let n = 4096usize;
+        let at = 3 * 65536 + 4; // the page's offset in the copy (a multiple of 4)
+        let old: Vec<u8> = (0..n).map(|i| (i * 7 + 1) as u8).collect();
+        // The title changes every third byte and a long run.
+        let mut title = old.clone();
+        for i in (0..n).step_by(3) {
+            title[i] ^= 0x5a;
+        }
+        for b in &mut title[1000..1100] {
+            *b = !*b;
+        }
+        let runs = super::changed_runs(&title, &old);
+        assert!(runs.len() > 1000);
+        // The card's side after the flights: the old bytes, but a flight
+        // stored into bytes the title did not change.
+        let mut card = old.clone();
+        let mut flight = vec![false; n];
+        for i in (1..n).step_by(5) {
+            if title[i] == old[i] {
+                card[i] = 0xee;
+                flight[i] = true;
+            }
+        }
+        let mut words: Vec<PatchWord> = Vec::new();
+        patch_words(at, &title, &runs, &mut words);
+        let words = folded(words);
+        for w in &words {
+            assert_eq!(w[0] % 4, 0);
+            let k = w[0] as usize - at;
+            let mut dword = [0u8; 4];
+            dword.copy_from_slice(&card[k..k + 4]);
+            let new = patched_word(u32::from_le_bytes(dword), *w).to_le_bytes();
+            card[k..k + 4].copy_from_slice(&new);
+        }
+        for i in 0..n {
+            let want = if flight[i] { 0xee } else { title[i] };
+            assert_eq!(card[i], want, "byte {i}");
+        }
+    }
+
+    /// Words of one dword made at different times fold into one, the later
+    /// bytes winning, in offset order.
+    #[test]
+    fn words_of_one_dword_fold_in_order() {
+        let words = vec![[8, 0x0000_00ff, 0x11], [0, 0xff00_0000, 0x2200_0000], [8, 0x0000_ffff, 0x3344]];
+        assert_eq!(folded(words), vec![[0, 0xff00_0000, 0x2200_0000], [8, 0x0000_ffff, 0x3344]]);
+        let mut out = Vec::new();
+        patch_words(0, &[1, 2, 3, 4, 5, 6], &[(1, 2), (5, 1)], &mut out);
+        assert_eq!(out, vec![[0, 0x00ff_ff00, 0x0003_0200], [4, 0x0000_ff00, 0x0000_0600]]);
+    }
 }
 
 #[cfg(test)]
@@ -3818,7 +4030,7 @@ impl Shadow {
             let page_of = |i: usize| -> (usize, usize) { ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e)) };
             let one = |i: usize| {
                 let (lo, hi) = page_of(i);
-                if lo < hi && !over.load(Ordering::Relaxed) {
+                if lo < hi && (!over.load(Ordering::Relaxed) || masked_patch_now()) {
                     // SAFETY: the reference holds the copy's bytes at the
                     // copy's offsets, and these are in a declared range; the
                     // locks held above keep out what else writes them, and
@@ -3907,7 +4119,17 @@ impl Shadow {
                 let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
                 let copies = runs.iter().filter(own).count() as i64;
                 if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
-                    return Err(());
+                    if !masked_patch_now() || at + n > u32::MAX as usize {
+                        return Err(());
+                    }
+                    let exact = changed_runs(title, held);
+                    self.card_patched(at, title, &exact);
+                    for &(r, m) in &exact {
+                        held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        MERGED[1].fetch_add(1, Ordering::Relaxed);
+                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                    return Ok(Some(Vec::new()));
                 }
                 let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
                 for &(r, m) in &runs {
@@ -4445,6 +4667,27 @@ impl Shadow {
         self.card.as_ref().map_or_else(Vec::new, |c| c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
+    /// The page at offset `at` of a copy in the card's memory takes the
+    /// title's bytes `title` at the changed runs `runs` (offsets in `title`)
+    /// as a masked patch ([`masked_patch_now`]), sent before the next
+    /// submission ([`card_patches`]).
+    fn card_patched(&self, at: usize, title: &[u8], runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if runs.is_empty() {
+            return;
+        }
+        let mut words = Vec::new();
+        patch_words(at, title, runs, &mut words);
+        PATCHED[0].fetch_add(1, Ordering::Relaxed);
+        PATCHED[1].fetch_add(words.len() as u64, Ordering::Relaxed);
+        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
+        patch.words.extend(words);
+        patch.ranges.extend(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
+    }
+
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
@@ -4648,8 +4891,14 @@ impl Shadow {
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
+            let mut skip: Vec<(usize, usize)> = dirty
+                .iter()
+                .copied()
+                .chain(patch.ranges.iter().copied())
+                .filter(|&(a, b)| a < at + n && b > at)
+                .collect();
             sent.near(fetched_after, at, at + n, &mut skip);
             skip
         };
@@ -4686,6 +4935,7 @@ impl Shadow {
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                patch: Mutex::default(),
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
                 size: len.next_multiple_of(PIECE as u64),
@@ -4744,8 +4994,14 @@ impl Shadow {
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+            let mut skip: Vec<(usize, usize)> = dirty
+                .iter()
+                .copied()
+                .chain(patch.ranges.iter().copied())
+                .filter(|&(a, b)| a < to && b > from)
+                .collect();
             sent.near(fetched_after, from, to, &mut skip);
             skip
         };
@@ -4843,8 +5099,9 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
-                touched: Default::default(),
-                me: std::sync::OnceLock::new(),
+            patch: Mutex::default(),
+            touched: Default::default(),
+            me: std::sync::OnceLock::new(),
             size: len as u64,
         });
         Some(shadow)
@@ -5288,8 +5545,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
-                touched: Default::default(),
-                me: std::sync::OnceLock::new(),
+                    patch: Mutex::default(),
+                    touched: Default::default(),
+                    me: std::sync::OnceLock::new(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5517,6 +5775,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
+        patch: Mutex::default(),
         touched: Default::default(),
         me: std::sync::OnceLock::new(),
         size: len,
@@ -5607,6 +5866,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                patch: Mutex::default(),
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
                 size: len,

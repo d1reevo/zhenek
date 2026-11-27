@@ -2197,6 +2197,8 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// With `VICTORY_MASKED_PATCH`: [`MASKED_PATCH`]'s pipeline, with `root`.
+    patch_pso: Option<ID3D12PipelineState>,
     /// One dword per piece compared, odd where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2224,6 +2226,56 @@ static COMPARE_HEAT: Mutex<Option<heat::Lean>> = Mutex::new(None);
 /// gets a dword per piece, odd where a byte differs. The offsets are widened
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
+/// The masked patch ([`crate::shadow::masked_patch_now`]): per changed
+/// dword of a copy in the card's memory (offset, mask, value; 12 bytes),
+/// the title's changed bytes stored and the others kept, after the flights
+/// before it in the queue. The compare's root signature, so it is bound
+/// with it: `count` words from word `first` of `words`, into `copy`.
+pub(crate) const MASKED_PATCH: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Patch : register(b0) {
+    uint count;
+    uint first;
+    uint unused0;
+    uint unused1;
+    uint unused2;
+    uint unused3;
+};
+ByteAddressBuffer words : register(t0);
+RWByteAddressBuffer copy : register(u0);
+RWByteAddressBuffer unused : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= count) return;
+    uint3 w = words.Load3((first + id.x) * 12u);
+    copy.Store(w.x, (copy.Load(w.x) & ~w.y) | (w.z & w.y));
+}
+"#;
+
+/// [`MASKED_PATCH`] compiled (as the compare is, `cs_5_1`).
+fn masked_patch_code() -> windows::core::Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    let mut code = None;
+    // SAFETY: the source and names live through the call; the out pointer is ours.
+    unsafe {
+        D3DCompile(
+            MASKED_PATCH.as_ptr().cast(),
+            MASKED_PATCH.len(),
+            windows::core::s!("masked patch"),
+            None,
+            None,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )?;
+    }
+    code.ok_or_else(windows::core::Error::empty)
+}
+
 ///
 /// A piece's 64 threads walk it side by side, each every 64th 16 bytes, and
 /// one of them hashes their 64 hashes: 64 steps after one another. One thread
@@ -2410,6 +2462,9 @@ struct CardPlan {
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    /// The masked patch's words ([`MASKED_PATCH`]), read by the plan's
+    /// list: alive until the submission has run.
+    _patch: Option<ID3D12Resource>,
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
@@ -3503,11 +3558,31 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Diagnostics for landed-list recycling and dynamic descriptor slots waiting
+/// for retirement: `[0]` us spent in `land()` on the submitting thread, `[1]`
+/// us spent in `land()` on `victory-late-wait`, `[2]` peak `line.landed.len()`
+/// observed, `[3]` peak unretired dynamic descriptor slots observed in
+/// `line.landed`, `[4]` peak dynamic descriptor slots held by a batch of
+/// settled flights right before `Detached::release_tables`.
+#[cfg(feature = "diagnostics")]
+static LAND_RETIRE_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
     let landed: Vec<_> = {
         let mut line = line();
+        #[cfg(feature = "diagnostics")]
+        {
+            LAND_RETIRE_STATS[2].fetch_max(line.landed.len() as u64, Ordering::Relaxed);
+            let pending: u64 = line
+                .landed
+                .iter()
+                .flat_map(|(lists, _)| lists.iter())
+                .map(crate::list::Detached::pending_dynamic_slots)
+                .sum();
+            LAND_RETIRE_STATS[3].fetch_max(pending, Ordering::Relaxed);
+        }
         let n = line.landed.len().saturating_sub(bury_lag() as usize);
         line.landed.drain(..n).collect()
     };
@@ -3515,6 +3590,10 @@ fn land() {
         crate::list::recycle(lists, &order);
     }
 }
+
+/// Whether `victory-late-wait` is alive and serving `line.poke` requests so
+/// `send_late` can offload `land()` off the submitting thread.
+static LATE_HELPER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
@@ -3531,6 +3610,7 @@ fn late_helper() {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
         return;
     };
+    LATE_HELPER_LIVE.store(true, Ordering::Release);
     loop {
         let target = {
             let mut line = line();
@@ -3548,7 +3628,11 @@ fn late_helper() {
         };
         let Some(target) = target else {
             let mut helping = crate::timeline::span("helper: landed lists reset and given back");
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             land();
+            #[cfg(feature = "diagnostics")]
+            LAND_RETIRE_STATS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             helping.next("helper: looking at what queues hold");
             crate::queue::release_held(false);
             continue;
@@ -3572,7 +3656,11 @@ fn late_helper() {
             }
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         land();
+        #[cfg(feature = "diagnostics")]
+        LAND_RETIRE_STATS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         crate::queue::release_held(false);
     }
 }
@@ -3913,7 +4001,58 @@ fn late_line(frames: f64) {
             );
         }
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        let submit_us = LAND_RETIRE_STATS[0].swap(0, Ordering::Relaxed) as f64;
+        let helper_us = LAND_RETIRE_STATS[1].swap(0, Ordering::Relaxed) as f64;
+        let peak_landed_flights = LAND_RETIRE_STATS[2].swap(0, Ordering::Relaxed);
+        let peak_landed_slots = LAND_RETIRE_STATS[3].swap(0, Ordering::Relaxed);
+        let peak_settled_slots = LAND_RETIRE_STATS[4].swap(0, Ordering::Relaxed);
+        let (in_flight_slots, landed_slots, landed_flights) = {
+            let line = line();
+            let in_flight: u64 = line
+                .line
+                .iter()
+                .filter_map(|item| match item {
+                    Late::Run(flight) => Some(&flight.lists),
+                    _ => None,
+                })
+                .flat_map(|lists| lists.iter())
+                .map(crate::list::Detached::pending_dynamic_slots)
+                .sum();
+            let landed: u64 = line
+                .landed
+                .iter()
+                .flat_map(|(lists, _)| lists.iter())
+                .map(crate::list::Detached::pending_dynamic_slots)
+                .sum();
+            (in_flight, landed, line.landed.len())
+        };
+        tracing::info!(
+            "landed list recycling per frame: {:.2} ms on submitting thread, {:.2} ms on helper thread; \
+             dynamic slots waiting for retirement: {} in flight (peak {} retired at settle), {} in landed (peak {} in landed; {} landed flights queued, peak {})",
+            submit_us / 1000.0 / frames,
+            helper_us / 1000.0 / frames,
+            in_flight_slots,
+            peak_settled_slots,
+            landed_slots,
+            peak_landed_slots.max(landed_slots),
+            landed_flights,
+            peak_landed_flights.max(landed_flights as u64),
+        );
+    }
     crate::land::log(frames);
+    if crate::shadow::masked_patch_mode() != 0 {
+        let p = [0, 1, 2, 3].map(|i| crate::shadow::PATCHED[i].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "masked patches per frame (VICTORY_MASKED_PATCH): {:.1} pages past the merge's cap patched instead of a settle, \
+             {:.0} dwords, {:.1} dispatches in {:.1} submissions",
+            p[0] as f64 / frames,
+            p[1] as f64 / frames,
+            p[2] as f64 / frames,
+            p[3] as f64 / frames
+        );
+    }
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -4489,12 +4628,41 @@ impl Host {
             })?;
             #[cfg(feature = "diagnostics")]
             name(&pso, || crate::replay::play::COMPARE.into());
+            // With `VICTORY_MASKED_PATCH`: the patch's pipeline, and from then
+            // on pages past the merge's cap may be patched.
+            let patch_pso = (crate::shadow::masked_patch_mode() != 0)
+                .then(|| {
+                    let made = masked_patch_code().and_then(|code| {
+                        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                        self.device.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::transmute_copy(&root),
+                            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                            ..Default::default()
+                        })
+                    });
+                    match made {
+                        Ok(pso) => {
+                            crate::shadow::PATCH_READY.store(true, Ordering::Relaxed);
+                            tracing::info!(
+                                "title bytes under flights' shader writes past the merge's cap go up as a masked patch (VICTORY_MASKED_PATCH={})",
+                                if crate::shadow::masked_patch_mode() == 2 { "alt" } else { "1" }
+                            );
+                            Some(pso)
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "VICTORY_MASKED_PATCH: the patch's pipeline could not be made; the flights are settled as before");
+                            None
+                        }
+                    }
+                })
+                .flatten();
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
                 root,
                 pso,
+                patch_pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -4538,8 +4706,9 @@ impl Host {
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        let patches = crate::shadow::card_patches(sent_as);
         gathering.end();
-        if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && looked.is_empty() && patches.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4557,6 +4726,37 @@ impl Host {
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
                     dirty.push((shadow.clone(), Vec::new()));
                 }
+            }
+        }
+        // A patched copy is hashed again with the others (its runs, beside
+        // its changed ranges): it is in `dirty`, with no ranges if it had none.
+        for (shadow, _, _) in &patches {
+            if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                dirty.push((shadow.clone(), Vec::new()));
+            }
+        }
+        // The patches' words in one buffer the card reads (PC memory), each
+        // copy's from its first word on.
+        let mut patch_buffer: Option<ID3D12Resource> = None;
+        let mut patch_at: Vec<(Arc<crate::shadow::Shadow>, u32, u32)> = Vec::new();
+        if !patches.is_empty() {
+            let words: usize = patches.iter().map(|(_, w, _)| w.len()).sum();
+            match (work.patch_pso.is_some(), self.upload_buffer((words * 12).max(16) as u64)) {
+                (true, Some((buffer, data))) => {
+                    name(&buffer, || "masked patch words".into());
+                    let mut first = 0u32;
+                    for (shadow, w, _) in &patches {
+                        // SAFETY: the mapping holds `words` words of 12 bytes.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), data.add(first as usize * 12), w.len() * 12);
+                        }
+                        patch_at.push((shadow.clone(), first, w.len() as u32));
+                        first += w.len() as u32;
+                    }
+                    crate::shadow::PATCHED[3].fetch_add(1, Ordering::Relaxed);
+                    patch_buffer = Some(buffer);
+                }
+                _ => fail(format_args!("no memory or pipeline for the masked patch of host copies in the card's memory (VICTORY_MASKED_PATCH)")),
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
@@ -4586,6 +4786,38 @@ impl Host {
                     // card do them one after the other.
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
+                    // The masked patches first: each copy from the common
+                    // state to unordered access, its words, then back (the
+                    // copies below promote it again).
+                    if let (Some(words), Some(pso)) = (&patch_buffer, &work.patch_pso) {
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(1, words.GetGPUVirtualAddress());
+                        let moves: Vec<_> = patch_at
+                            .iter()
+                            .map(|(s, _, _)| transition(&s.buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                            .collect();
+                        list.ResourceBarrier(&moves);
+                        for (shadow, first, count) in &patch_at {
+                            list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                            const MOST: u32 = 65535 * 64;
+                            let mut done = 0u32;
+                            while done < *count {
+                                let n = (*count - done).min(MOST);
+                                let constants = [n, first + done, 0, 0, 0, 0];
+                                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                                list.Dispatch(n.div_ceil(64), 1, 1);
+                                crate::shadow::PATCHED[2].fetch_add(1, Ordering::Relaxed);
+                                done += n;
+                            }
+                        }
+                        let backs: Vec<_> = patch_at
+                            .iter()
+                            .map(|(s, _, _)| transition(&s.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON))
+                            .collect();
+                        list.ResourceBarrier(&backs);
+                    }
                     if let Some(own) = &own {
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
@@ -4640,7 +4872,9 @@ impl Host {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            let patched = patches.iter().find(|(s, _, _)| Arc::ptr_eq(s, shadow))
+                                .map_or(&[][..], |(_, _, r)| r.as_slice());
+                            for run in ranges.iter().chain(patched).map(|&(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
                                     _ => runs.push(run),
@@ -4671,6 +4905,7 @@ impl Host {
             ranges: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _patch: patch_buffer,
             lists: used,
             sent_as,
             looks,
@@ -5204,6 +5439,8 @@ impl Host {
         stage.next("landing: read-backs, telling the title");
         let mut last = 0;
         let mut landed = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let mut retiring_slots = 0u64;
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
@@ -5219,6 +5456,10 @@ impl Host {
                         own.landed();
                     }
                     for detached in &mut flight.lists {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            retiring_slots += detached.pending_dynamic_slots();
+                        }
                         detached.release_tables();
                     }
                     landed.push((flight.lists, flight.order));
@@ -5234,6 +5475,8 @@ impl Host {
                 }
             };
         }
+        #[cfg(feature = "diagnostics")]
+        LAND_RETIRE_STATS[4].fetch_max(retiring_slots, Ordering::Relaxed);
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
@@ -5520,8 +5763,18 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        // Every push to `line.landed` (`relay_land` and `settle`) already sets
+        // `line.poke` or runs `land()` directly on `victory-late-wait`, so
+        // `send_late` only falls back to inline `land()` if the helper thread
+        // failed to start.
+        if !LATE_HELPER_LIVE.load(Ordering::Acquire) {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            land();
+            #[cfg(feature = "diagnostics")]
+            LAND_RETIRE_STATS[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         AFTER_SEND.fetch_add(after.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -5688,6 +5941,8 @@ impl Host {
             // In the order given: what tells the title the card is done.
             let mut last = 0;
             let mut landed = Vec::new();
+            #[cfg(feature = "diagnostics")]
+            let mut retiring_slots = 0u64;
             for item in items {
                 match item {
                     Late::Run(mut flight) => {
@@ -5699,6 +5954,10 @@ impl Host {
                             self.card_done(card);
                         }
                         for detached in &mut flight.lists {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                retiring_slots += detached.pending_dynamic_slots();
+                            }
                             detached.release_tables();
                         }
                         landed.push((flight.lists, flight.order));
@@ -5707,6 +5966,8 @@ impl Host {
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            LAND_RETIRE_STATS[4].fetch_max(retiring_slots, Ordering::Relaxed);
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
@@ -10009,8 +10270,8 @@ impl Host {
                 crate::compose::view(&over_desc)?,
             ))
         });
-        let format = if planes.is_some() {
-            DXGI_FORMAT_R8G8B8A8_UNORM
+        let format = if let Some((_, _, base, over)) = planes {
+            crate::compose::output_format(base, over)
         } else {
             let Some(format) = swap_format(desc.Format) else {
                 tracing::warn!(format = desc.Format.0, "cannot present this format");
@@ -11729,6 +11990,19 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod masked_patch_compile_tests {
+    /// The patch's source compiles as the compare's does, with the same root
+    /// signature inside it (no device needed).
+    #[test]
+    fn the_masked_patch_compiles() {
+        let code = super::masked_patch_code().expect("MASKED_PATCH compiles");
+        // SAFETY: the blob's own bytes.
+        let size = unsafe { code.GetBufferSize() };
+        assert!(size > 100);
     }
 }
 

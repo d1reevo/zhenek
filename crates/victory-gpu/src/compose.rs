@@ -23,12 +23,15 @@ V vs(uint id : SV_VertexID) {
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
-[RootSignature(RS)]
-float4 ps(V v) : SV_Target {
+float4 composite(V v) {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
-    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    return float4(o.rgb + s.rgb * (1 - saturate(o.a)), 1);
 }
+[RootSignature(RS)]
+float4 ps(V v) : SV_Target { return saturate(composite(v)); }
+[RootSignature(RS)]
+float4 ps_float(V v) : SV_Target { return composite(v); }
 "#;
 
 pub(crate) struct Composer {
@@ -66,10 +69,12 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
 
 impl Composer {
     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
-        let (vs, ps) = (
-            compile(s!("vs"), s!("vs_5_1"))?,
-            compile(s!("ps"), s!("ps_5_1"))?,
-        );
+        let pixel = if format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+            s!("ps_float")
+        } else {
+            s!("ps")
+        };
+        let (vs, ps) = (compile(s!("vs"), s!("vs_5_1"))?, compile(pixel, s!("ps_5_1"))?);
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
             let bytes = |b: &ID3DBlob| {
@@ -188,6 +193,21 @@ impl Composer {
         }
         Ok(())
     }
+}
+
+/// Use the widest presentation format needed by either display plane.
+pub(crate) fn output_format(base: DXGI_FORMAT, overlay: DXGI_FORMAT) -> DXGI_FORMAT {
+    static HIGH_PRECISION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *HIGH_PRECISION.get_or_init(|| std::env::var_os("VICTORY_HIGH_PRECISION_OUTPUT").is_some_and(|v| v == "1")) {
+        let planes = [base, overlay];
+        if planes.iter().any(|f| (9..=14).contains(&f.0)) {
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        }
+        if planes.iter().any(|f| (23..=25).contains(&f.0)) {
+            return DXGI_FORMAT_R10G10B10A2_UNORM;
+        }
+    }
+    DXGI_FORMAT_R8G8B8A8_UNORM
 }
 
 /// Select a legal float-sampled view of a display plane, preserving a typed
