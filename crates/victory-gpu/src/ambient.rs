@@ -267,8 +267,9 @@ void keep(uint3 at : SV_DispatchThreadID) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
         c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
-        // Lamps and glints count, but not for everything.
-        c /= max(1.0, dot(c, LUMA) / 20.0);
+        // Lamps and glints count, but not for everything. Keep daylight sky/water
+        // headroom high enough so shadows against bright sun do not crush to black.
+        c /= max(1.0, dot(c, LUMA) / 80.0);
         // Not the stand-in's own light, reflected (`once`).
         float4 share = cells[SHARES + (at.y * CX + at.x) * 25 + y * 5 + x];
         sum += once > 0.0 && share.y > 0.0 ? c * saturate(share.x) : c;
@@ -482,9 +483,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
         sum += w;
     }
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-    found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // Surfaces facing back toward the camera (e.g. backs against bright sun/water)
+    // cannot see the hemisphere behind the camera in screen-space cells; keep their
+    // sky/environment fill floor high instead of crushing to 0.2 * all.
+    found = all + 0.6 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = clamp(found, 0.7 * all, 2.0 * all);
+    found = max(found, 0.65 * cells[CELLS].rgb);
+    found = lerp(found, cells[CELLS].rgb, 0.3) * level * open;
     float3 was = unpack(light[p]);
     was = (any(isnan(was)) || any(isinf(was))) ? 0.0 : max(was, 0.0);
     // Magenta/violet garbage the probes' memory held (green far under red and
