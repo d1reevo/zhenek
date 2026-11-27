@@ -19,6 +19,9 @@ impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
     /// Native code another compiler made, in place of `DXIL` (VIctory upstream 0b35b7f).
     pub const ACCC: FourCC = FourCC(*b"ACCC");
+    /// A program a title passed as loose pieces, in a container of our own
+    /// making (`crate::pieces`); no title's container has this part.
+    pub const PIECES: FourCC = FourCC(*b"VPCS");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
@@ -110,6 +113,15 @@ impl<'a> Container<'a> {
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
+    }
+
+    /// The part that holds the container's native programs
+    /// ([`crate::native_programs`] reads its data): `DXIL`, else `ACCC`,
+    /// else the part of a program made from loose pieces.
+    pub fn native_part(&self) -> Option<&Part<'a>> {
+        self.part(FourCC::DXIL)
+            .or(self.part(FourCC::ACCC))
+            .or(self.part(FourCC::PIECES))
     }
 }
 

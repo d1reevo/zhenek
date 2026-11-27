@@ -210,7 +210,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .collect();
             (loaded, &inputs[..], &[][..])
         }
-        (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
+        (StageIo::Vs { inputs, outputs, .. }, HwStage::Vs) => {
             let mut loaded = vec![
                 (Reg::V(0), Input::VertexId),
                 (Reg::V(2), Input::PrimitiveId),

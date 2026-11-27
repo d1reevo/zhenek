@@ -102,7 +102,14 @@ pub(crate) fn kept() -> [u64; 7] {
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
-    let full = blake3::hash(bytes);
+    shader_of(stage, std::borrow::Cow::Borrowed(bytes))
+}
+
+/// The shared container for `bytes`, which are kept as they are when they
+/// come owned and no pipeline had them yet (a container put together from
+/// loose pieces, [`pieces`]: read from title memory once, into this).
+fn shader_of(stage: &'static str, bytes: std::borrow::Cow<[u8]>) -> Arc<Shader> {
+    let full = blake3::hash(&bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
@@ -113,9 +120,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
                 #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                ambient: (stage == "compute").then(|| crate::ambient::role(&bytes)).flatten(),
+                container: bytes.into_owned(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -189,20 +196,19 @@ impl Shader {
 impl Shader {
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
-        use victory_shader::{Container, FourCC};
+        use victory_shader::Container;
         let c = Container::parse(&self.container).ok()?;
-        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
-        victory_shader::native_programs(part.data).ok()
+        victory_shader::native_programs(c.native_part()?.data).ok()
     }
 }
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    let programs = match c.native_part() {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
@@ -325,12 +331,44 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// Whether `VICTORY_BVH_BUILDER=1` was asked at launch.
+#[cfg(windows)]
+pub(crate) fn bvh_builder_asked() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Whether `VICTORY_BVH_MISS=1` forces every BVH node test to miss.
+#[cfg(windows)]
+pub(crate) fn bvh_miss_forced() -> bool {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+}
+
+/// Whether launch switches guarantee every BVH ray misses (`VICTORY_BVH_BUILDER != 1`
+/// or `VICTORY_BVH_MISS=1`), so dependent pipelines can be left out at creation.
+#[cfg(windows)]
+pub(crate) fn rt_always_miss() -> bool {
+    !bvh_builder_asked() || bvh_miss_forced()
+}
+
+/// Whether ray-tracing structures are missing or empty at draw/dispatch time:
+/// `VICTORY_BVH_BUILDER != 1`, `VICTORY_BVH_MISS=1`, or the builder turned
+/// itself permanently off because a stage lacked a host pipeline.
+#[cfg(windows)]
+pub(crate) fn rt_miss() -> bool {
+    if rt_always_miss() {
+        return true;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    !b.whole && b.off > 0 && b.off == b.pipelines.len()
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !bvh_builder_asked() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -421,6 +459,11 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Why this pipeline is skipped if BVH rays miss at runtime (when
+    /// `VICTORY_BVH_BUILDER=1` was asked at launch, so `Pending.left_out`
+    /// stayed `None`).
+    #[cfg(windows)]
+    rt_miss_left_out: Option<&'static str>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -483,6 +526,23 @@ pub(crate) fn making() -> u64 {
 #[cfg(windows)]
 pub(crate) fn take_left_out() -> u64 {
     make::take_left_out()
+}
+
+/// Counts a dispatch skipped at runtime because [`rt_miss`] became true.
+#[cfg(windows)]
+pub(crate) fn note_left_out() {
+    make::note_left_out();
+}
+
+/// If `this` is an RT skinning/VBuffer trace pipeline whose work is useless
+/// while [`rt_miss`] holds (and was not already left out at creation), returns
+/// the reason to skip it.
+#[cfg(windows)]
+pub(crate) fn rt_miss_skipped(this: This) -> Option<&'static str> {
+    (!this.is_null())
+        .then(|| pipeline(this).rt_miss_left_out)
+        .flatten()
+        .filter(|_| rt_miss())
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -595,6 +655,12 @@ fn hand_out(
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
+    let rt_miss_left_out = if host.is_left_out() {
+        None
+    } else {
+        make::rt_miss_reason(&shaders)
+    };
+    #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -608,6 +674,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        rt_miss_left_out,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -783,6 +851,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) mod pieces;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

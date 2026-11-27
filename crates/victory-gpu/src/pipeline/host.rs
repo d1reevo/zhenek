@@ -92,7 +92,7 @@ impl Default for GraphicsState {
 }
 
 /// Integer render target formats: D3D12 cannot blend into them.
-fn integer_format(f: DXGI_FORMAT) -> bool {
+pub(super) fn integer_format(f: DXGI_FORMAT) -> bool {
     matches!(
         f,
         DXGI_FORMAT_R32G32B32A32_UINT
@@ -525,6 +525,7 @@ impl HostPipeline {
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_TABLE_STRIDES
+                            || slot == victory_shader::emit::SLOT_DESCRIPTOR_REMAP
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {

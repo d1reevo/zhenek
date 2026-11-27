@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -29,6 +29,8 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
 /// running the full bindless heap buffer sweep.
 pub const SLOT_TABLE_STRIDES: u8 = 252;
+/// The root SRV for title descriptor indices on the capped view heap.
+pub const SLOT_DESCRIPTOR_REMAP: u8 = 251;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
@@ -154,6 +156,13 @@ pub(crate) struct Geometry {
 /// larger) hung its GPU (GPU-based validation: "descriptor heap index out of bounds"), and AMD
 /// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Remap indices only on the one-million-slot heap, which has no raw twins.
+pub fn descriptor_remap() -> bool {
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    view_heap_limit() == 999_999 && raw_views() == 0
+        && *ASKED.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_REMAP").is_some_and(|v| v == "1"))
+}
 
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
@@ -490,7 +499,22 @@ impl Shader {
         // (the raw twins of buffer views lie past it: such an index comes bounded)
         let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
-        let index = if !sampler && limit != 0 {
+        let index = if !sampler && !bounded && descriptor_remap() {
+            let i32t = self.t.i32;
+            let last = self.m.i32(SLOT_STRIDES_COUNT - 1);
+            let slot = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+            self.m.tag(slot, super::bitcode::Tag::Clamp);
+            let two = self.m.i32(2);
+            let byte = self.m.bin(block, Bin::Shl, slot, two);
+            let handle = self.root_srv_handle(SLOT_DESCRIPTOR_REMAP);
+            let unused = self.m.undef(i32t);
+            let mask = self.m.i8(1);
+            let alignment = self.m.i32(4);
+            let words = self.op(block, "rawBufferLoad.f32", Attr::ReadOnly, self.t.res_ret,
+                139, &[handle, byte, unused, mask, alignment]);
+            let word = self.m.extract(block, words, 0);
+            self.m.cast(block, Cast::Bitcast, word, i32t)
+        } else if !sampler && limit != 0 {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);

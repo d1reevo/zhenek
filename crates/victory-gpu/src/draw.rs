@@ -2073,6 +2073,30 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_DESCRIPTOR_REMAP {
+                        let Some((buffer, gpu)) = self.heaps.iter().copied()
+                            .filter(|&h| h != 0)
+                            .map(|h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|h| h.remap_buffer())
+                        else {
+                            once!("a shader needs a descriptor map but no view heap is set");
+                            return false;
+                        };
+                        if list.first_use(gpu as usize) {
+                            list.keep(buffer);
+                        }
+                        // SAFETY: an open list retaining the upload buffer.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_TABLE_STRIDES {
                         // Ours: the shader inspects typed view kinds for its
                         // descriptor tables only (already mirrored by `tables`),
@@ -3711,6 +3735,16 @@ impl State {
             }
             return;
         }
+        if let Some(why) = crate::pipeline::rt_miss_skipped(self.pipeline as This) {
+            crate::pipeline::note_left_out();
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_why(format!("left out on purpose: {why}"));
+                self.list_dropped_roots([x, y, z]);
+            }
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -4446,7 +4480,7 @@ impl State {
                 || match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
                         heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
+                            .is_some_and(|host| group.needs_snapshot(heap, host.contiguous_count(), table))
                     }),
                     _ => false,
                 };
@@ -5087,6 +5121,12 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        if let Some(why) = crate::pipeline::rt_miss_skipped(self.pipeline as This) {
+            crate::pipeline::note_left_out();
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("left out on purpose: {why}"));
             return false;
         }
         const DRAW: u32 = 0;

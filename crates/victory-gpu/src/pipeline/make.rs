@@ -50,6 +50,109 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
 }
 
+fn container_has_matching_name(bytes: &[u8], pred: &impl Fn(&str) -> bool) -> bool {
+    use victory_shader::{Container, FourCC};
+    if let Ok(c) = Container::parse(bytes)
+        && let Some(psv0) = c.part(FourCC::PSV0)
+    {
+        return slice_has_matching_name(psv0.data, pred);
+    }
+    slice_has_matching_name(bytes, pred)
+}
+
+fn slice_has_matching_name(hay: &[u8], pred: &impl Fn(&str) -> bool) -> bool {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i < hay.len() {
+        if is_ident(hay[i]) {
+            let start = i;
+            while i < hay.len() && is_ident(hay[i]) {
+                i += 1;
+            }
+            if i - start >= 6
+                && let Ok(name) = std::str::from_utf8(&hay[start..i])
+                && pred(name)
+            {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn compute_name_matches(shaders: &[Arc<Shader>], pred: impl Fn(&str) -> bool) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && container_has_matching_name(&s.container, &pred))
+}
+
+/// RT BVH skinning compute shaders (`bvh_skinning` and `bvh_skinning_smh`).
+/// Excludes standard raster skinning (`CS_PedStandardSkinning_*`,
+/// `CS_PosOnlyLodSkinning*`), cloth skinning (`clothSkinning*` /
+/// `computeclothSkinning*`), and hair index generation (`CSGenerateHairIB*`).
+pub(super) fn is_rt_skin_name(name: &str) -> bool {
+    name.starts_with("CSComputeSkinning") || name.starts_with("CSGenerateHairVB")
+}
+
+/// RT VBuffer ray-tracing passes without BVH (`CS_RaytraceVBuffer_*` except
+/// `Voxels` and `Fallback` variants, which keep indirect lighting and
+/// reflections working). Kept on by default (`VICTORY_SKIP_VBUFFER=0`) to avoid
+/// darkening materials/water; enable via `VICTORY_SKIP_VBUFFER=1`.
+pub(super) fn is_rt_vbuffer_trace_name(name: &str) -> bool {
+    name.starts_with("CS_RaytraceVBuffer")
+        && !name.contains("Voxels")
+        && !name.contains("Fallback")
+}
+
+/// Empty-BVH ray-tracing passes skipped by `VICTORY_SKIP_EMPTY_RT=1` / `all`.
+/// Preserves `Fallback` and `Voxels` variants (e.g.
+/// `CS_ScreenProbes_TraceRays_Fallback_*`, `CS_ScreenProbes_TraceRays_Voxels_*`,
+/// `CS_RaytraceVBuffer_Voxels_*`) so indirect lighting and reflections stay intact.
+fn is_empty_rt_pass_name(name: &str, mode: u8) -> bool {
+    if mode == 0 || name.contains("Voxels") || name.contains("Fallback") {
+        return false;
+    }
+    const EMPTY_RT_BASE: [&str; 5] = [
+        "CS_ScreenProbes_TraceRays",
+        "CS_IrradianceCache_ShadowTrace",
+        "CS_ScreenProbes_EvaluateRayRequests",
+        "CS_ScreenProbes_GenerateRayBins",
+        "CS_ScreenProbes_GenerateShaderBins",
+    ];
+    EMPTY_RT_BASE.iter().any(|p| name.starts_with(p))
+        || (mode >= 2 && is_rt_vbuffer_trace_name(name))
+}
+
+fn rt_skin_skip_allowed() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| !std::env::var_os("VICTORY_RT_SKIN").is_some_and(|v| v == "1"))
+}
+
+fn rt_trace_skip_allowed() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var_os("VICTORY_SKIP_VBUFFER").is_some_and(|v| v == "1"))
+}
+
+fn rt_miss_reason_with(
+    shaders: &[Arc<Shader>],
+    skip_skin: bool,
+    skip_trace: bool,
+) -> Option<&'static str> {
+    if skip_skin && compute_name_matches(shaders, is_rt_skin_name) {
+        return Some("RT skinning/hair BVH pass without BVH, left out");
+    }
+    if skip_trace && compute_name_matches(shaders, is_rt_vbuffer_trace_name) {
+        return Some("RT VBuffer ray-tracing pass without BVH (VICTORY_SKIP_VBUFFER=1), left out");
+    }
+    None
+}
+
+pub(super) fn rt_miss_reason(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    rt_miss_reason_with(shaders, rt_skin_skip_allowed(), rt_trace_skip_allowed())
+}
+
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
@@ -92,6 +195,24 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
         && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
 
+fn log_rt_left_out(shaders: &[Arc<Shader>], why: &str) {
+    static LOGGED: AtomicU8 = AtomicU8::new(0);
+    for s in shaders.iter().filter(|s| s.stage == "compute") {
+        let bit = if container_has_matching_name(&s.container, &|n| n.starts_with("CSComputeSkinning")) {
+            1
+        } else if container_has_matching_name(&s.container, &|n| n.starts_with("CSGenerateHairVB")) {
+            2
+        } else if container_has_matching_name(&s.container, &is_rt_vbuffer_trace_name) {
+            4
+        } else {
+            0
+        };
+        if bit != 0 && (LOGGED.fetch_or(bit, Ordering::Relaxed) & bit) == 0 {
+            tracing::info!(hash = %s.hash, reason = why, "skipping empty-BVH RT compute pipeline");
+        }
+    }
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
         return Some("named in VICTORY_LEAVE_OUT, left out");
@@ -99,10 +220,10 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if water_light_left_out(shaders) {
         return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
     }
+    let always_miss = super::rt_always_miss();
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if !super::rt_always_miss() {
             return false;
         }
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
@@ -114,8 +235,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if !super::rt_always_miss() {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
@@ -123,14 +243,19 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    if always_miss && let Some(why) = rt_miss_reason(shaders) {
+        log_rt_left_out(shaders, why);
+        return Some(why);
+    }
     // Opt-in empty-BVH RT compute skip (`VICTORY_SKIP_EMPTY_RT=1` or `all`):
     // skips open-world BVH ray-trace/binning passes when the BVH builder is off,
-    // preserving ambient.rs hooks (`CS_ScreenProbes_TemporalResolve`,
-    // `CS_CacheScreenSpaceRadiance`, `CS_AccumulateLocalLightInscatteringVolume`,
-    // `CS_RayMiss_*`) and raster/tiled shadow passes.
+    // preserving `Fallback` and `Voxels` variants, `ambient.rs` hooks
+    // (`CS_ScreenProbes_TemporalResolve`, `CS_CacheScreenSpaceRadiance`,
+    // `CS_AccumulateLocalLightInscatteringVolume`, `CS_RayMiss_*`), and
+    // raster/tiled shadow passes.
     static SKIP_EMPTY_RT: OnceLock<u8> = OnceLock::new();
     let skip_empty_rt = *SKIP_EMPTY_RT.get_or_init(|| {
-        if std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
+        if !super::rt_always_miss() {
             return 0;
         }
         match std::env::var("VICTORY_SKIP_EMPTY_RT").as_deref() {
@@ -139,19 +264,8 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
             _ => 0,
         }
     });
-    if skip_empty_rt > 0 {
-        const EMPTY_RT_BASE: [&[u8]; 5] = [
-            b"CS_ScreenProbes_TraceRays",
-            b"CS_IrradianceCache_ShadowTrace",
-            b"CS_ScreenProbes_EvaluateRayRequests",
-            b"CS_ScreenProbes_GenerateRayBins",
-            b"CS_ScreenProbes_GenerateShaderBins",
-        ];
-        if EMPTY_RT_BASE.iter().any(|p| named(shaders, p))
-            || (skip_empty_rt >= 2 && named(shaders, b"CS_RaytraceVBuffer"))
-        {
-            return Some("empty-BVH ray-tracing compute pass (VICTORY_SKIP_EMPTY_RT), left out");
-        }
+    if skip_empty_rt > 0 && compute_name_matches(shaders, |n| is_empty_rt_pass_name(n, skip_empty_rt)) {
+        return Some("empty-BVH ray-tracing compute pass (VICTORY_SKIP_EMPTY_RT), left out");
     }
     None
 }
@@ -298,6 +412,11 @@ static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
 /// See [`LEFT_OUT`] (for the frame line).
 pub(crate) fn take_left_out() -> u64 {
     LEFT_OUT.swap(0, Ordering::Relaxed)
+}
+
+/// Counts an RT pass skipped at dispatch/execute_indirect time.
+pub(super) fn note_left_out() {
+    LEFT_OUT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Pipelines queued and not made yet (for the frame line).
@@ -769,5 +888,56 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    fn dxbc_with_psv0(psv0: &str) -> Vec<u8> {
+        let payload = psv0.as_bytes();
+        let part_offset = 0x24u32;
+        let total = part_offset + 8 + payload.len() as u32;
+        let mut out = Vec::with_capacity(total as usize);
+        out.extend_from_slice(b"DXBC");
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&total.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&part_offset.to_le_bytes());
+        out.extend_from_slice(b"PSV0");
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn rt_miss_filter_matches_bvh_skinning_and_trace_but_preserves_raster_and_voxels() {
+        let cs = |name: &str| vec![super::super::shader("compute", &dxbc_with_psv0(name))];
+        let skin = cs("CSComputeSkinningDefault_1c34db0a_Wrapped");
+        let hair = cs("CSGenerateHairVB_c88a8f19_Wrapped");
+        let vbuf = cs("CS_RaytraceVBuffer_NoOpacity_1823fa11_Wrapped");
+        let vbuf_vox = cs("CS_RaytraceVBuffer_Voxels_82fa8a29_Wrapped");
+        let ped_skin = cs("CS_PedStandardSkinning_0_15f19d85_Wrapped");
+        let cloth = cs("computeclothSkinning");
+        // The shader registry interns by bytes, so the vertex fixture needs its own container.
+        let vs_only = vec![super::super::shader("vertex", &dxbc_with_psv0("CSComputeSkinningTreeAnim_d2f99501_Wrapped"))];
+
+        assert!(rt_miss_reason_with(&skin, true, false).is_some());
+        assert!(rt_miss_reason_with(&hair, true, false).is_some());
+        assert!(rt_miss_reason_with(&vbuf, true, false).is_none());
+        assert!(rt_miss_reason_with(&vbuf, true, true).is_some());
+
+        // Opt-out switches: VICTORY_RT_SKIN=1 and VICTORY_SKIP_VBUFFER=1
+        assert!(rt_miss_reason_with(&skin, false, true).is_none());
+        assert!(rt_miss_reason_with(&hair, false, true).is_none());
+        assert!(rt_miss_reason_with(&vbuf, false, true).is_some());
+
+        // Non-BVH skinning, Voxels, and non-compute stages are never skipped.
+        assert!(rt_miss_reason_with(&vbuf_vox, true, true).is_none());
+        assert!(rt_miss_reason_with(&ped_skin, true, true).is_none());
+        assert!(rt_miss_reason_with(&cloth, true, true).is_none());
+        assert!(rt_miss_reason_with(&vs_only, true, true).is_none());
+
+        // Raw-slice fallback (e.g. truncated/synthetic container without DXBC header).
+        let raw = vec![super::super::shader("compute", b"..CSGenerateHairVB_c88a8f19_Wrapped..")];
+        assert!(rt_miss_reason_with(&raw, true, false).is_some());
     }
 }

@@ -135,9 +135,10 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
-    /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
-    /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
+    remap: Option<ViewRemap>,
+    last_kept_sweep: std::sync::atomic::AtomicU64,
+    /// Contiguous dynamic slots past the title's logical range.
+    /// The remapped NVIDIA heap reserves 2^17 physical slots for them.
     dynamic: u32,
     sampler: bool,
     /// Where the raw twins of the title's slots start
@@ -563,6 +564,66 @@ fn take_pending_list_flip(id: u64) -> Option<Flip> {
 
 fn remove_pending_list_flip(id: u64) {
     let _ = take_pending_list_flip(id);
+}
+
+/// A slot that goes on showing another texture of the same description
+/// until its new one is made and uploaded (as the title wrote it,
+/// [`HostHeap::mirror`], or as the texture pass took it,
+/// [`HostHeap::show_later`]): the title record's handle and key, the frame
+/// it was first so, and why the swap that was to end it was let go, if one
+/// was.
+struct Holding {
+    handle: u64,
+    key: u64,
+    since: u64,
+    why: &'static str,
+}
+
+/// The slots kept so, by heap (its address) and slot. A swap is made only
+/// by a flip ([`HostHeap::texture_slots_flip`]), and a flip is let go when
+/// the record was written again, when the texture's memory was unmapped by
+/// then, when the host could not make the view, or never comes (a list
+/// whose steps never ran, an upload job that did not end). The write
+/// was marked done when the upload was recorded: nothing brought the slot
+/// back to the queue, and it showed the other texture for the rest of the
+/// run. (And while the card has no room, the pass holds back the slot of a
+/// texture without its host copy, which goes on showing the other one as
+/// long as that lasts.) The prison guard's forearms showed a normal map's flat blue in
+/// some runs and the tattooed skin in others (amb-t6, amb-t8).
+static HOLDING: Mutex<std::collections::BTreeMap<(usize, u32), Holding>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Since the start: slots found still showing the texture they showed
+/// before their new one [`kept_sweep`] frames after it was asked for (a
+/// lost swap); of them made from their new view; whose new texture had no
+/// host copy yet (due again, left as they were: the card may have had no
+/// room); given the neutral texture (the host could not make the view);
+/// and flips let go because the host could not make the view (index 3).
+static SWEPT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// After how many frames a slot that still shows the texture it showed
+/// before its new one, with the title's record unchanged, is taken for a
+/// lost swap: it is made from its new view then if that texture has its
+/// host copy (the neutral texture if the host cannot make the view), and
+/// its texture is due again either way (`VICTORY_KEPT_SWEEP=<frames>`, 120; `0`: such slots are counted and
+/// logged and stay as they are, as before).
+fn kept_sweep() -> (u64, bool) {
+    const FRAMES: u64 = 120;
+    static SWEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let frames = *SWEEP.get_or_init(|| {
+        std::env::var("VICTORY_KEPT_SWEEP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FRAMES)
+    });
+    if frames == 0 { (FRAMES, false) } else { (frames, true) }
+}
+
+/// Why the flip of a kept slot was let go: noted on its [`Holding`].
+fn holding_lost(heap: usize, index: u32, key: u64, why: &'static str) {
+    let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = holding.get_mut(&(heap, index))
+        && h.key == key
+    {
+        h.why = why;
+    }
 }
 
 /// Makes the slots whose new texture's upload has run
@@ -2089,6 +2150,98 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
+/// Stable spill slots: a slot stays assigned to one title index for the
+/// life of its heap, including while submissions may read the descriptor.
+struct ViewRemap {
+    buffer: ID3D12Resource,
+    gpu: u64,
+    mapped: usize,
+    direct: u32,
+    spill_end: u32,
+    count: u32,
+    null: u32,
+    spill: Box<[std::sync::atomic::AtomicU32]>,
+    next: std::sync::atomic::AtomicU32,
+    exhausted: std::sync::atomic::AtomicBool,
+}
+
+impl ViewRemap {
+    fn new(host: &crate::host::Host, count: u32, extra: u32, null: u32) -> Option<Self> {
+        use victory_shader::emit::SLOT_STRIDES_COUNT;
+        let direct = count.min(null.saturating_sub(DYNAMIC));
+        let spill_end = null - extra;
+        let (buffer, map) = host.upload_buffer(u64::from(SLOT_STRIDES_COUNT) * 4)?;
+        // SAFETY: the fresh upload mapping holds SLOT_STRIDES_COUNT dwords.
+        let data = unsafe { std::slice::from_raw_parts_mut(map.cast::<u32>(), SLOT_STRIDES_COUNT as usize) };
+        data.fill(null);
+        for i in 0..direct {
+            data[i as usize] = i;
+        }
+        for i in 0..extra {
+            data[(count + i) as usize] = spill_end + i;
+        }
+        // SAFETY: a live upload buffer, retained by the heap and bound lists.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        tracing::info!(count, direct, spill = spill_end - direct, dynamic = extra, null, "title descriptor remapping enabled");
+        Some(Self {
+            buffer,
+            gpu,
+            mapped: map as usize,
+            direct,
+            spill_end,
+            count,
+            null,
+            spill: (direct..count).map(|_| std::sync::atomic::AtomicU32::new(null)).collect(),
+            next: std::sync::atomic::AtomicU32::new(direct),
+            exhausted: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn get(&self, index: u32) -> u32 {
+        use std::sync::atomic::Ordering::Acquire;
+        if index < self.direct {
+            index
+        } else if index < self.count {
+            self.spill[(index - self.direct) as usize].load(Acquire)
+        } else {
+            self.spill_end.saturating_add(index - self.count).min(self.null)
+        }
+    }
+
+    /// Called under this title index's made lock. Free spill entries already
+    /// contain null descriptors, so the renderer can see them before put().
+    fn assign(&self, index: u32) -> bool {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        if index < self.direct {
+            return true;
+        }
+        let entry = &self.spill[(index - self.direct) as usize];
+        if entry.load(Relaxed) != self.null {
+            return true;
+        }
+        let Ok(slot) = self.next.fetch_update(Relaxed, Relaxed, |next| {
+            (next < self.spill_end).then_some(next + 1)
+        }) else {
+            if !self.exhausted.swap(true, Relaxed) {
+                tracing::warn!(index, spill_end = self.spill_end, "title descriptor spill exhausted");
+            }
+            return false;
+        };
+        // SAFETY: the live mapping has one dword per logical slot; only
+        // this thread publishes this slot, under its made lock.
+        unsafe { (self.mapped as *mut u32).add(index as usize).write_volatile(slot) };
+        entry.store(slot, Release);
+        true
+    }
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        let heap = std::ptr::from_ref(self) as usize;
+        HOLDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(h, _), _| h != heap);
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -2121,7 +2274,8 @@ impl HostHeap {
             victory_shader::emit::view_heap_limit()
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
-        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        let remapping = !sampler && victory_shader::emit::descriptor_remap();
+        let extra = if sampler { 0 } else if remapping { 1 << 17 } else { dynamic_slots(count, null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -2132,7 +2286,9 @@ impl HostHeap {
             }
         } else {
             let size = if raw == 0 { null + 1 } else { 2 * raw };
-            let fitted = if count + extra <= null {
+            let fitted = if remapping {
+                count.min(victory_shader::emit::SLOT_STRIDES_COUNT - extra - 1)
+            } else if count + extra <= null {
                 count
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
@@ -2177,6 +2333,7 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let remap = if remapping { Some(ViewRemap::new(host, count, extra, null)?) } else { None };
         let marks = std::sync::Arc::new(QueueMarks::new(if sampler { 0 } else { count as usize }));
         let h = HostHeap {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2186,6 +2343,8 @@ impl HostHeap {
             cpu,
             step,
             count,
+            remap,
+            last_kept_sweep: std::sync::atomic::AtomicU64::new(u64::MAX),
             dynamic: extra,
             sampler,
             raw,
@@ -2231,6 +2390,9 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, size) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+            if remapping {
+                return None;
+            }
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -2275,7 +2437,7 @@ impl HostHeap {
                 }
                 while done < end {
                     let n = BLOCK.min(end - done);
-                    host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                    host.device.CopyDescriptorsSimple(n, self.physical_cpu(done), start, kind);
                     done += n;
                 }
             }
@@ -2436,6 +2598,16 @@ impl HostHeap {
 
     /// The GPU address of the table of element strides by title slot (view
     /// heaps).
+    /// Tables spanning any spill slot have to be copied into a contiguous
+    /// dynamic run, even if every individual descriptor can be remapped.
+    pub(crate) fn contiguous_count(&self) -> u32 {
+        self.remap.as_ref().map_or(self.count, |r| r.direct)
+    }
+
+    pub(crate) fn remap_buffer(&self) -> Option<(&ID3D12Resource, u64)> {
+        self.remap.as_ref().map(|r| (&r.buffer, r.gpu))
+    }
+
     pub(crate) fn strides_gpu(&self) -> Option<u64> {
         self.strides.as_ref().map(|s| s.1)
     }
@@ -3005,10 +3177,8 @@ impl HostHeap {
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
-            let kept = old.is_some_and(|old| match kin(&old, &view) {
-                Kin::Same => true,
-                kin => kin.kept(keep_shown()),
-            });
+            let other = old.as_ref().map(|old| kin(old, &view));
+            let kept = other.is_some_and(|kin| kin == Kin::Same || kin.kept(keep_shown()));
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(index, shown, "neutral");
@@ -3019,6 +3189,10 @@ impl HostHeap {
                 self.clear_twin(index);
                 LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
                 self.keep(index, kept);
+            } else if matches!(other, Some(Kin::Moved | Kin::Other)) {
+                // It goes on showing another texture: until a flip, which
+                // may never come ([`HOLDING`]).
+                self.hold(index, handle, key);
             }
             stale
         };
@@ -3046,7 +3220,7 @@ impl HostHeap {
     pub(crate) fn mirror_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
         if show_after()
             && !crate::texture::BAKING.get()
-            && index < self.count
+            && index < self.contiguous_count()
             && !self.texture_slot_made_from(index, handle)
             && let Some(view) = super::view(handle)
             && let Some(View::Shader(resource, _)) = placed_texture(&view).or(Some(view))
@@ -3181,6 +3355,9 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 return false;
             };
+            if self.remap.as_ref().is_some_and(|r| !r.assign(index)) {
+                return false;
+            }
             let stale = self.note_buffer(index, Some(&view), true);
             if let Some(kept) = make(&view, self.at(index)) {
                 self.put(index);
@@ -3201,6 +3378,7 @@ impl HostHeap {
     /// ([`HostHeap::texture_slot_flip`]); returns how many.
     pub(crate) fn texture_slots_flip(&self) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        self.sweep_kept();
         let finished = crate::host::submissions().1;
         let ready: Vec<Flip> = {
             let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3239,6 +3417,7 @@ impl HostHeap {
             let (true, true, Some(view)) = (f.key != 0 && record_key(f.handle) == f.key, there, view) else {
                 FLIPPED[1].fetch_add(1, Relaxed);
                 LATE[4].fetch_add(u64::from(f.late.is_some()), Relaxed);
+                holding_lost(f.heap, f.index, f.key, "its record was written again or went");
                 continue;
             };
             // Its memory went meanwhile: the texture pass finds that.
@@ -3249,10 +3428,16 @@ impl HostHeap {
                 let len = crate::resource::placed_bytes(resource).unwrap_or(1);
                 if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
                     LATE[4].fetch_add(1, Relaxed);
+                    holding_lost(f.heap, f.index, f.key, "its memory was unmapped by the swap");
                     continue;
                 }
             }
-            if let Some(kept) = make(&view, self.at(f.index)) {
+            let made = make(&view, self.at(f.index));
+            if made.is_none() {
+                SWEPT[3].fetch_add(1, Relaxed);
+                holding_lost(f.heap, f.index, f.key, "the host could not make its view at the swap");
+            }
+            if let Some(kept) = made {
                 #[cfg(feature = "diagnostics")]
                 note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
                 self.put(f.index);
@@ -3286,6 +3471,153 @@ impl HostHeap {
         }
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
         flipped + late_flipped
+    }
+
+    /// Slot `index` goes on showing another texture than the one the
+    /// record at `handle` (key `key`) views, until that one is made
+    /// ([`HOLDING`]). Kept from the first time it was so.
+    fn hold(&self, index: u32, handle: u64, key: u64) {
+        let heap = std::ptr::from_ref(self) as usize;
+        let since = crate::frame::current();
+        let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = holding.entry((heap, index)).or_insert(Holding { handle, key, since, why: "no swap came" });
+        if entry.key != key {
+            *entry = Holding { handle, key, since, why: "no swap came" };
+        }
+    }
+
+    /// The slots of this heap kept showing another texture ([`HOLDING`]):
+    /// those whose swap came are let go; one still kept [`kept_sweep`]
+    /// frames after it was asked for, with the title's record as it was, is
+    /// a lost swap. It is made from its new view (the neutral texture if
+    /// the host cannot make that), and its texture is due again so that the
+    /// texture pass uploads what it holds. Once a frame.
+    fn sweep_kept(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let frame = crate::frame::current();
+        if self.last_kept_sweep.swap(frame, Relaxed) == frame {
+            return;
+        }
+        let heap = std::ptr::from_ref(self) as usize;
+        let (frames, remake) = kept_sweep();
+        // (Taken out under the map's lock, looked at under each slot's.)
+        let mut lost = Vec::new();
+        {
+            let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
+            if holding.is_empty() {
+                return;
+            }
+            holding.retain(|&(h, index), kept| {
+                if h != heap {
+                    return true;
+                }
+                // Swapped, showing nothing of another texture any more, or
+                // written again (that write is in the queue).
+                let shown = self.made.get(index);
+                if shown == Some(kept.key) || shown == Some(0) || record_key(kept.handle) != kept.key {
+                    return false;
+                }
+                if frame.saturating_sub(kept.since) < frames {
+                    return true;
+                }
+                lost.push((index, kept.handle, kept.key, kept.since, kept.why));
+                false
+            });
+        }
+        let (mut due, mut again) = (Vec::new(), Vec::new());
+        for (index, handle, key, since, why) in lost {
+            let _made = self.made.lock(index);
+            let Some(shown) = self.made.get(index) else {
+                continue;
+            };
+            if shown == key || shown == 0 || record_key(handle) != key {
+                continue;
+            }
+            let n = SWEPT[0].fetch_add(1, Relaxed) + 1;
+            let view = view_at(key as u32, (key >> 32) as u32);
+            if n <= 16 || n.is_power_of_two() {
+                let shape = |key: u64| match view_at(key as u32, (key >> 32) as u32) {
+                    Some(View::Placed(false, resource, desc)) => format!(
+                        "{}x{} f{} at {:#x}",
+                        resource[4],
+                        resource[6],
+                        resource[8],
+                        u64::from(desc[10]) | u64::from(desc[11]) << 32
+                    ),
+                    Some(other) => format!("{other:?}").chars().take(80).collect(),
+                    None => "nothing".into(),
+                };
+                tracing::warn!(
+                    lost = n,
+                    slot = index,
+                    frames = frame.saturating_sub(since),
+                    why,
+                    shown = %shape(shown),
+                    new = %shape(key),
+                    remade = remake,
+                    "a slot still showed the texture it showed before its new one: its swap was lost (VICTORY_KEPT_SWEEP)"
+                );
+            }
+            if !remake {
+                continue;
+            }
+            // Made from its new view only if that texture has its host copy:
+            // none is made here (the card may have no room for it, which is
+            // when the pass leaves such slots for later).
+            let has_copy = |view: &View| match view {
+                View::Placed(false, resource, desc) if resource[0] != 1 => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    crate::resource::texture_at_made(address, resource)
+                        .and_then(crate::resource::made_copy)
+                        .is_some()
+                }
+                View::Shader(r, _) => crate::resource::made_copy(*r as crate::object::This).is_some(),
+                _ => false,
+            };
+            if !view.as_ref().is_some_and(has_copy) {
+                // Left as it is, due again, and looked at again later.
+                SWEPT[2].fetch_add(1, Relaxed);
+                again.push((index, handle, key, why));
+                due.push(index);
+                continue;
+            }
+            let made = view.as_ref().and_then(|view| make(view, self.at(index)));
+            if let Some(kept) = made {
+                #[cfg(feature = "diagnostics")]
+                note_before(index, shown, "swept");
+                self.put(index);
+                self.quick_is(index, 0);
+                self.made.set(index, key);
+                self.keep(index, kept);
+                SWEPT[1].fetch_add(1, Relaxed);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                note_before(index, shown, "swept, neutral");
+                self.quick_is(index, 0);
+                self.made.set(index, 0);
+                let kept = match &view {
+                    Some(view) => neutral_for(view, self.at(index)),
+                    None => {
+                        null_view(self.at(index));
+                        None
+                    }
+                };
+                self.put(index);
+                self.clear_twin(index);
+                self.keep(index, kept);
+                SWEPT[4].fetch_add(1, Relaxed);
+            }
+            due.push(index);
+        }
+        if !again.is_empty() {
+            let mut holding = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, handle, key, why) in again {
+                holding.entry((heap, index)).or_insert(Holding { handle, key, since: frame, why });
+            }
+        }
+        for index in due {
+            self.queue_texture(index, true, false, frame);
+        }
     }
 
     /// The memory of the texture title slot `index` views is there (again):
@@ -3704,6 +4036,9 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
+            if self.remap.as_ref().is_some_and(|r| r.get(index) == victory_shader::emit::view_heap_limit()) {
+                return;
+            }
             null_view(self.at(index));
             self.put(index);
             self.write_stride(index, 0);
@@ -3883,7 +4218,7 @@ impl HostHeap {
         // SAFETY: a live shader-visible heap.
         let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: start + u64::from(self.physical_index(index)) * u64::from(self.step),
         }
     }
 
@@ -3975,7 +4310,15 @@ impl HostHeap {
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
     }
 
+    fn physical_index(&self, index: u32) -> u32 {
+        self.remap.as_ref().map_or(index, |r| r.get(index))
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        self.physical_cpu(self.physical_index(index))
+    }
+
+    fn physical_cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
@@ -4086,6 +4429,11 @@ impl HostHeap {
         let held = self.made.lock(index);
         let shown = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        if view.is_some()
+            && self.remap.as_ref().is_some_and(|r| !r.assign(index))
+        {
+            return None;
+        }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -4140,6 +4488,14 @@ impl HostHeap {
                     let kept = kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
+                        // Until the texture pass makes the new one, which
+                        // may not be soon ([`HOLDING`]). (Not one of
+                        // another size: the same texture streamed, whose
+                        // smaller one may stand for it while the card is
+                        // full.)
+                        if matches!(kin, Kin::Moved | Kin::Other) {
+                            self.hold(index, handle, key);
+                        }
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
@@ -5387,12 +5743,18 @@ fn rewritten(kin: Kin, kept: bool) {
     let n: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
     if n.is_multiple_of(5000) {
         tracing::info!(
-            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN)",
+            "slots that showed a texture and were written with another, since the start: {} of the same kind elsewhere, {} of another size, {} others, {} of another dimension; {} of them kept what they showed meanwhile (VICTORY_KEEP_SHOWN); swaps lost, the slot still showing the other texture {} frames on: {} ({} made from the new view, {} whose new texture had no host copy yet, {} given the neutral texture; VICTORY_KEPT_SWEEP); swaps whose view the host could not make: {}",
             REWRITTEN[0].load(Relaxed),
             REWRITTEN[1].load(Relaxed),
             REWRITTEN[2].load(Relaxed),
             REWRITTEN[3].load(Relaxed),
-            REWRITTEN[4].load(Relaxed)
+            REWRITTEN[4].load(Relaxed),
+            kept_sweep().0,
+            SWEPT[0].load(Relaxed),
+            SWEPT[1].load(Relaxed),
+            SWEPT[2].load(Relaxed),
+            SWEPT[4].load(Relaxed),
+            SWEPT[3].load(Relaxed)
         );
     }
 }

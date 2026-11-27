@@ -6599,6 +6599,16 @@ impl<'a> Lower<'a> {
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
         }
+        if self.scalar.get(&site).is_some_and(|a| self.vertex_table(a.param)) {
+            // A vertex buffer's descriptor: the fetches through it read the
+            // host's input layout (`vertex_fetch`), and its dwords (an
+            // address, a stride, a size) have no value here.
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::Missing("a vertex buffer's descriptor read as data"));
+                self.stale.insert(v);
+            }
+            return Ok(());
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -12144,6 +12154,14 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
+        // Through a vertex buffer's descriptor: one of the program's own
+        // vertex fetches.
+        if let Some(&src) = self.descriptors.get(&(site, false))
+            && let Some((param, byte)) = self.entry(src)
+            && self.vertex_table(param)
+        {
+            return self.vertex_fetch(inst, byte, guard);
+        }
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
         // min and max, exchange; compare-exchange apart.
@@ -12649,14 +12667,148 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether layout entry `param` is the table of vertex buffer
+    /// descriptors of a program that fetches its own attributes.
+    fn vertex_table(&self, param: usize) -> bool {
+        let entry = self.x.native.layout.get(param);
+        entry.is_some_and(|p| p.root == RootType::Other(crate::native::VERTEX_BUFFERS))
+    }
+
+    /// A vertex program's own fetch of an attribute: a buffer load through
+    /// the descriptor at byte `entry` of the vertex buffer table (16 bytes
+    /// a slot), at the vertex index and a constant byte of the vertex. It
+    /// becomes a read of the input signature, so the host's input assembler
+    /// fetches (and adds the base vertex, as the code does with s2).
+    ///
+    /// Only the forms seen are taken: whole dwords of a 32-bit float
+    /// element, and an `R8G8B8A8_UNORM` element through a typed load of
+    /// that format or of one of its bytes. Anything else is refused: a
+    /// fetch that reads what the element does not hold would draw wrong.
+    fn vertex_fetch(&mut self, inst: &Inst, entry: u32, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Buffer {
+            data,
+            addr,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            format,
+            lds,
+            tfe,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let name = inst.name();
+        let plain = matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128));
+        if !*idxen || *offen || !plain || *lds || *tfe || !entry.is_multiple_of(16) {
+            return Err("a vertex fetch that is not by vertex index at a constant byte");
+        }
+        // The index must be the vertex's own: v0 as it arrives plus s2 as
+        // it arrives (the base vertex), which is what the host adds too.
+        let Operand::Vector { reg: areg, .. } = *addr else {
+            return Err("a buffer address");
+        };
+        let index = inst.read(Reg::V(areg)).ok_or("a buffer address")?;
+        let p = self.x.p;
+        let arrives = |reg: Reg| p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
+        let own = p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            i.name() == "v_add_nc_u32"
+                && i.writes.iter().any(|w| w.1 == index)
+                && i.read(Reg::S(2)).is_some_and(|v| Some(v) == arrives(Reg::S(2)))
+                && i.read(Reg::V(0)).is_some_and(|v| Some(v) == arrives(Reg::V(0)))
+                && matches!(&i.fields, Fields::Valu(f) if f.src.len() == 2
+                    && f.sdwa.is_none()
+                    && f.dpp.is_none()
+                    && f.src.iter().any(|s| matches!(s, Operand::Scalar { code: 2, .. }))
+                    && f.src.iter().any(|s| matches!(s, Operand::Vector { reg: 0, .. })))
+        });
+        if !own {
+            return Err("a vertex fetch at an index that is not the vertex's own");
+        }
+        // The element of the input layout that holds the byte.
+        let StageIo::Vs { fetch, .. } = &self.x.native.io else {
+            return Err("a vertex fetch outside a vertex program");
+        };
+        let (slot, byte) = (entry / 16, u32::from(*offset));
+        let e = fetch
+            .iter()
+            .find(|e| e.slot == slot && byte >= e.offset && byte - e.offset < e.bytes)
+            .ok_or("a vertex fetch outside the elements whose format is handled")?;
+        let within = byte - e.offset;
+        let channels = crate::pieces::element_shape(e.format).map_or(0, |s| u32::from(s.1));
+        // The first channel read and how many, by the load and the format.
+        let dwords = match name {
+            "buffer_load_dword" => Some(1),
+            "buffer_load_dwordx2" => Some(2),
+            "buffer_load_dwordx3" => Some(3),
+            "buffer_load_dwordx4" => Some(4),
+            _ => None,
+        };
+        let typed = match name.strip_prefix("tbuffer_load_format_") {
+            Some("x") => Some(1),
+            Some("xy") => Some(2),
+            Some("xyz") => Some(3),
+            Some("xyzw") => Some(4),
+            _ => None,
+        };
+        let bytes = e.format == crate::pieces::R8G8B8A8_UNORM;
+        let (first, count) = match (dwords, typed, format.and_then(|f| buffer_format(f))) {
+            // Whole dwords of a float element.
+            (Some(n), None, None) if !bytes && within.is_multiple_of(4) => (within / 4, n),
+            // All four bytes as normalized values, or some of the first.
+            (None, Some(n), Some((&[8, 8, 8, 8], Numeric::Unorm))) if bytes && within == 0 => (0, n),
+            // One byte as a normalized value.
+            (None, Some(1), Some((&[8], Numeric::Unorm))) if bytes => (within, 1),
+            _ => return Err("a vertex fetch of a form or format that is not handled"),
+        };
+        if first + count > channels {
+            return Err("a vertex fetch past its element");
+        }
+        let Some(Operand::Vector { reg, .. }) = *data else {
+            return Err("a buffer result");
+        };
+        for k in 0..count {
+            let (id, col) = self
+                .find_input(e.row, (first + k) as u8)
+                .ok_or("a vertex input the signature lacks")?;
+            // (float elements arrive as their bits, normalized ones as the
+            // float the typed load gives)
+            let x = match self.load_input(id, col) {
+                Val::I32(x) => x,
+                Val::Bit(x) => self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32),
+                Val::Missing(w) => return Err(w),
+            };
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
-            return Err("a compressed export");
-        }
+        // A compressed export holds two 16-bit values in each of its two
+        // dwords: channel c in half c % 2 of dword c / 2. It is taken apart
+        // for a render target the signature declares as 16-bit floats (a
+        // program whose exports are final, made from loose pieces, with the
+        // `FP16_ABGR` export format); what the halves are under any other
+        // format is not known here.
+        let packed = match e.target {
+            Target::Color(n) if e.compressed => {
+                let declared = self.s.outputs.iter().any(|o| {
+                    o.kind == 16 && o.row == Some(u32::from(n)) && o.half && o.comp == 9
+                });
+                if !declared {
+                    return Err("a compressed export");
+                }
+                true
+            }
+            _ if e.compressed => return Err("a compressed export"),
+            _ => false,
+        };
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
@@ -12734,6 +12886,17 @@ impl<'a> Lower<'a> {
             };
             if halves.is_some() {
                 break;
+            }
+            if packed {
+                // (the element is all four channels of its register)
+                if let Target::Color(n) = e.target
+                    && let Some(id) = outputs.iter().position(|o| {
+                        o.kind == 16 && o.row == Some(u32::from(n)) && ch >= o.col && ch < o.col + o.cols
+                    })
+                {
+                    stores.push((id, ch - outputs[id].col, value, Some(ch % 2 == 1)));
+                }
+                continue;
             }
             let found = match e.target {
                 Target::Color(n) => outputs
