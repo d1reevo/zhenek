@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+pub(crate) mod placed_lookup;
+pub(crate) mod view_lookup;
 
 thread_local! {
     /// Set while this thread runs the pass over textures picked by index
@@ -1207,18 +1209,6 @@ impl Views {
         Some(at)
     }
 
-    /// The view of placed memory [`placed_words`] named.
-    fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
-        let payload = payload(i, generation);
-        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&rest[..10]);
-        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        desc[12..].copy_from_slice(&rest[10..]);
-        Some(View::Placed(unordered, resource, desc))
-    }
-
     /// The record words of `view` as a table entry, if it has one.
     fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
         let &i = self.index.get(view)?;
@@ -1233,6 +1223,7 @@ impl Views {
             None => {
                 let i = match self.free.pop() {
                     Some(i) => {
+                        view_lookup::replacing(i);
                         self.list[i as usize].0 = view.clone();
                         i
                     }
@@ -1268,9 +1259,7 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
-                    if let Some(shape) = shape {
+                    if let Some(shape) = placed_lookup::number(&shape) {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
                     }
@@ -1552,6 +1541,7 @@ pub(crate) fn forget(resource: usize) {
             continue;
         }
         views.index.remove(&view);
+        view_lookup::replacing(i);
         // (Below the bits that say a record is no table entry.)
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
@@ -1564,13 +1554,23 @@ pub(crate) fn forget(resource: usize) {
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
+        0 if view_lookup::enabled() => view_lookup::lookup(i, generation),
         0 => {
             let views = views_read();
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => {
+            let packed = payload(i, generation);
+            let address = packed & ((1 << PLACED_ADDRESS_BITS) - 1);
+            let (unordered, resource, rest) = placed_lookup::shape((packed >> PLACED_ADDRESS_BITS) as u32)?;
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&rest[..10]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            desc[12..].copy_from_slice(&rest[10..]);
+            Some(View::Placed(unordered, resource, desc))
+        }
         _ => None,
     }
 }

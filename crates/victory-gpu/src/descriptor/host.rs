@@ -210,6 +210,7 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    texture_writes: TextureWrites,
     /// What `textures` holds, read without its lock ([`QueueMarks`]).
     marks: std::sync::Arc<QueueMarks>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
@@ -1172,6 +1173,109 @@ fn host_texture_left_out() {
     });
 }
 
+const TEXTURE_WRITE_SHARDS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct TextureWrite {
+    index: u32,
+    frame: u64,
+    due: u64,
+    keeps: bool,
+    seen: bool,
+}
+
+/// Recording threads publish to a shard without waiting for queue scans or
+/// texture admission. A consumer applies published writes before reading
+/// or changing the queue.
+#[derive(Default)]
+struct TextureWrites {
+    shards: [Mutex<TextureWriteShard>; TEXTURE_WRITE_SHARDS],
+    ready: AtomicU64,
+    next: AtomicU64,
+}
+
+#[derive(Default)]
+struct TextureWriteShard {
+    writes: Vec<(u64, TextureWrite)>,
+    latest: std::collections::HashMap<u32, bool>,
+}
+
+#[cfg(test)]
+mod deferred_texture_writes {
+    use super::*;
+
+    #[test]
+    fn drains_in_write_order_and_obsolete_completion_cannot_remove_new_write() {
+        let pending = TextureWrites::default();
+        let mut queue = TextureQueue::default();
+        let write = |index, keeps| TextureWrite { index, keeps, frame: 7, due: 0, seen: false };
+        pending.push(write(31, true));
+        pending.push(write(1, true));
+        pending.apply(&mut queue);
+        let previous = queue.slots[&31].write;
+        assert!(previous < queue.slots[&1].write);
+
+        pending.push(write(31, false));
+        assert_eq!(pending.latest(31), Some(false));
+        pending.push(write(31, true));
+        pending.apply(&mut queue);
+        queue.done(31, previous);
+        assert!(queue.slots[&31].write > previous);
+        assert_eq!(pending.latest(31), None);
+    }
+}
+
+impl TextureWrites {
+    fn shard(index: u32) -> usize {
+        (index ^ (index >> 5)) as usize % TEXTURE_WRITE_SHARDS
+    }
+
+    fn push(&self, write: TextureWrite) {
+        let index = Self::shard(write.index);
+        let mut shard = self.shards[index].lock().unwrap_or_else(|e| e.into_inner());
+        shard.writes.push((self.next.fetch_add(1, Ordering::Relaxed), write));
+        shard.latest.insert(write.index, write.keeps);
+        self.ready.fetch_or(1 << index, Ordering::Release);
+    }
+
+    fn latest(&self, slot: u32) -> Option<bool> {
+        let index = Self::shard(slot);
+        if self.ready.load(Ordering::Acquire) & (1 << index) == 0 {
+            return None;
+        }
+        self.shards[index].lock().unwrap_or_else(|e| e.into_inner()).latest.get(&slot).copied()
+    }
+
+    fn apply(&self, queue: &mut TextureQueue) {
+        let mut ready = self.ready.load(Ordering::Acquire);
+        if ready == 0 {
+            return;
+        }
+        let active = ready;
+        let mut guards = Vec::with_capacity(ready.count_ones() as usize);
+        let mut writes = Vec::new();
+        while ready != 0 {
+            let index = ready.trailing_zeros() as usize;
+            ready &= ready - 1;
+            let mut shard = self.shards[index].lock().unwrap_or_else(|e| e.into_inner());
+            writes.append(&mut shard.writes);
+            shard.latest.clear();
+            guards.push(shard);
+        }
+        // Keep the original cross-slot age ordering used by the due queue.
+        writes.sort_unstable_by_key(|&(number, _)| number);
+        for (_, write) in writes {
+            if write.keeps {
+                queue.written(write.index, write.frame, write.due, write.seen);
+            } else {
+                queue.remove(write.index);
+            }
+        }
+        // Make marks visible before a reader can bypass a pending shard.
+        self.ready.fetch_and(!active, Ordering::Release);
+    }
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -2103,6 +2207,7 @@ impl HostHeap {
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::new(TextureQueue::with_marks(marks.clone())),
+            texture_writes: TextureWrites::default(),
             marks,
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -2239,7 +2344,7 @@ impl HostHeap {
     fn queue(&self, site: usize) -> QueueGuard<'_> {
         use super::queue_site::{DUE, MADE_DUE, STALE};
         use std::sync::atomic::Ordering::Relaxed;
-        let queue = match self.textures.try_lock() {
+        let mut queue = match self.textures.try_lock() {
             Ok(queue) => queue,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -2251,6 +2356,7 @@ impl HostHeap {
         };
         super::QUEUE_LOCK[0][site].fetch_add(1, Relaxed);
         let held = matches!(site, DUE | MADE_DUE | STALE).then(|| (site, std::time::Instant::now()));
+        self.texture_writes.apply(&mut queue);
         QueueGuard { queue, held }
     }
 
@@ -2261,7 +2367,7 @@ impl HostHeap {
         if !queue_marks() {
             return None;
         }
-        self.marks.get(index).map(|write| write != 0)
+        self.texture_writes.latest(index).or_else(|| self.marks.get(index).map(|write| write != 0))
     }
 
     /// `n` consecutive free dynamic slots (view heaps only), taken until
@@ -2365,6 +2471,9 @@ impl HostHeap {
     /// marks (0: none; [`QueueMarks`]); `None`: not known so (ask the queue).
     pub(crate) fn texture_slot_write(&self, index: u32) -> Option<u64> {
         if !queue_marks() {
+            return None;
+        }
+        if self.texture_writes.latest(index).is_some() {
             return None;
         }
         self.marks.get(index)
@@ -3327,18 +3436,13 @@ impl HostHeap {
             not_taken(super::queue_site::WRITE);
             return;
         }
-        let mut textures = self.queue(super::queue_site::WRITE);
-        if keeps {
-            let due = if lately && !seen {
-                TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                frame + TABLED_GRACE
-            } else {
-                0
-            };
-            textures.written(index, frame, due, seen);
+        let due = if keeps && lately && !seen {
+            TABLED_WRITES[0].fetch_add(1, Ordering::Relaxed);
+            frame + TABLED_GRACE
         } else {
-            textures.remove(index);
-        }
+            0
+        };
+        self.texture_writes.push(TextureWrite { index, frame, due, keeps, seen });
     }
 
     /// Title slot `index` lies in a table a draw reads or had made afresh:

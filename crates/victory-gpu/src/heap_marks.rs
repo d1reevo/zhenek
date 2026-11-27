@@ -3,7 +3,7 @@
 //!
 //! Ported from Belobug/VIctory-Belobug-AMD 673be0e and a609a2f (renderer
 //! port 7, its heaps' records part; there under `VICTORY_PORT_JOURNAL` with
-//! the journal in parts, which is not taken here). There the submitting lane
+//! sharded journal in `watch.rs`). There the submitting lane
 //! waited 4.5-5.2 ms a frame for the heaps' records, and port 7 took 2.4 ms
 //! off the lane. Here it waited 2.7-5.8 ms a frame (release run 233354).
 //!
@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// Whether the switch is on.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_AT_SUBMIT"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_AT_SUBMIT")) || crate::watch::port_journal()
 }
 
 /// With rounds `asked` asked for and `done` done (one runs at a time, in
@@ -108,6 +108,10 @@ pub(crate) fn heaps_waited(ns: u64) {
 /// The frame line's, per frame.
 pub(crate) fn line(frames: f64) {
     let s: [f64; 7] = std::array::from_fn(|i| STATS[i].swap(0, Relaxed) as f64);
+    let journal = crate::watch::port_journal_counts();
+    if crate::watch::port_journal() {
+        tracing::info!("write-watch journal (VICTORY_PORT_JOURNAL=1), per frame: {}", journal.per_frame(frames.max(1.0)));
+    }
     if !on() {
         return;
     }

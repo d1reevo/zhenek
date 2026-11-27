@@ -464,6 +464,14 @@ pub(crate) fn hashes_of(this: This) -> String {
     host_pipeline(this).map_or_else(String::new, |p| p.name.clone())
 }
 
+/// Whether one of the containers of the title pipeline `this` is one `f`
+/// picks (false for none bound). Known at the call, before any host
+/// pipeline is made.
+#[cfg(windows)]
+pub(crate) fn shaders_any(this: This, f: impl Fn(&Shader) -> bool) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| f(s))
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

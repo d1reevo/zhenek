@@ -413,11 +413,10 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
-    let mut does = Vec::new();
+fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> StepScan {
+    let (mut does, mut steps) = SCAN.take();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
-    let mut steps = Vec::new();
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
@@ -459,7 +458,28 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
         }
     }
-    (does, steps)
+    StepScan { does, steps }
+}
+
+#[derive(Default)]
+struct StepScan {
+    does: Vec<Does>,
+    steps: Vec<(usize, usize)>,
+}
+
+type ScanBuffers = (Vec<Does>, Vec<(usize, usize)>);
+
+thread_local! {
+    static SCAN: std::cell::Cell<ScanBuffers> = const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+}
+
+impl Drop for StepScan {
+    fn drop(&mut self) {
+        self.does.clear();
+        self.steps.clear();
+        let buffers = (std::mem::take(&mut self.does), std::mem::take(&mut self.steps));
+        let _ = SCAN.try_with(|slot| slot.set(buffers));
+    }
 }
 
 /// With flights in the air: before which of `runs` the submission is cut so
@@ -477,9 +497,10 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let scan = does_of(&written, runs);
+    let (does, steps) = (&scan.does, &scan.steps);
     let mut behind = None;
-    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
+    if plan(does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
     }
     let (placed, reader) = behind?;
@@ -688,8 +709,9 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let scan = does_of(written, runs);
+        let (does, steps) = (&scan.does, &scan.steps);
+        let chosen = plan(does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
         }

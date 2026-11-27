@@ -527,7 +527,67 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    let entry = (started, Retired::Resource(object));
+    match BATCH.with(|b| into_batch(b.borrow_mut().as_mut(), entry, BATCH_MOST)) {
+        Err(entry) => RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back(entry),
+        Ok(true) => flush_retired(),
+        Ok(false) => {}
+    }
+}
+
+/// `entry` into the thread's batch, if it keeps one: whether the batch then
+/// holds `most` and is to be handed over. With no batch the entry comes back.
+fn into_batch<T>(batch: Option<&mut Vec<T>>, entry: T, most: usize) -> Result<bool, T> {
+    match batch {
+        Some(batch) => {
+            batch.push(entry);
+            Ok(batch.len() >= most)
+        }
+        None => Err(entry),
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    #[test]
+    fn a_thread_without_a_batch_keeps_nothing_and_a_full_batch_says_so() {
+        assert_eq!(super::into_batch(None, 7, 2), Err(7));
+        let mut batch = Vec::new();
+        assert_eq!(super::into_batch(Some(&mut batch), 7, 2), Ok(false));
+        assert_eq!(super::into_batch(Some(&mut batch), 8, 2), Ok(true));
+        assert_eq!(batch, [7, 8]);
+    }
+}
+
+/// So many resources a thread retires before it hands them over by itself.
+const BATCH_MOST: usize = 256;
+
+thread_local! {
+    /// What this thread retired and has not handed to [`RETIRED`] yet
+    /// ([`retire_in_batches`]).
+    static BATCH: std::cell::RefCell<Option<Vec<(u64, Retired)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// From here on this thread's [`retire_resource`] keeps what it is given and
+/// hands it to the common line in batches ([`flush_retired`], or
+/// [`BATCH_MOST`] of them). Twelve threads translating lists took the line's
+/// lock for each of some 20,000 descriptor slots a frame that changed their
+/// resource: 21% of their samples stood at that lock (Vilocity, profile of
+/// 2026-11-27). Handed over later an object is dropped later, never sooner:
+/// its number is the one of the moment it was let go.
+pub(crate) fn retire_in_batches() {
+    BATCH.with(|b| *b.borrow_mut() = Some(Vec::with_capacity(BATCH_MOST)));
+}
+
+/// Hands over what this thread retired since the last time ([`retire_in_batches`]).
+pub(crate) fn flush_retired() {
+    BATCH.with(|b| {
+        if let Some(batch) = b.borrow_mut().as_mut()
+            && !batch.is_empty()
+        {
+            RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(batch.drain(..));
+        }
+    });
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -2155,6 +2215,9 @@ unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
+// The relay holds this after CARD_WORK while planning and on its own while reading results.
+static COMPARE_HEAT: Mutex<Option<heat::Lean>> = Mutex::new(None);
+
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one group per 64 KiB piece (cut at multiples of
 /// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
@@ -3265,15 +3328,24 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
-    let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
+    thread_local! {
+        static WRITTEN: std::cell::Cell<Vec<(usize, usize)>> = const { std::cell::Cell::new(Vec::new()) };
+        static JOINED: std::cell::Cell<Vec<(usize, usize)>> = const { std::cell::Cell::new(Vec::new()) };
+    }
+    let mut written = WRITTEN.take();
+    written.extend(declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges));
     for list in &ahead {
         let deferred = list.deferred();
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
         written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
     }
-    let mut joined = Vec::new();
-    join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    let mut joined = JOINED.take();
+    join_ranges(&mut joined, written.drain(..));
+    let can_join = blocked_by(&joined, next, false).is_none();
+    joined.clear();
+    WRITTEN.set(written);
+    JOINED.set(joined);
+    can_join
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
@@ -3875,6 +3947,7 @@ mod font;
 mod menu;
 mod panel;
 mod place;
+mod heat;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -4606,6 +4679,8 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
+        let every = (flown && relay()).then(heat::every).flatten();
+        let mut heat = every.map(|_| COMPARE_HEAT.lock().unwrap_or_else(|e| e.into_inner()));
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -4621,20 +4696,31 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
-                plan.ranges.push(CardRange {
-                    shadow: shadow.clone(),
-                    declared: (from, to),
-                    span,
-                    at,
-                    compared,
-                    picked: false,
-                });
-                if compared {
-                    at += span.pieces;
+                let mut add = |span: crate::shadow::CardSpan, declared| {
+                    let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                    plan.ranges.push(CardRange { shadow: shadow.clone(), declared, span, at, compared, picked: false });
+                    if compared {
+                        at += span.pieces;
+                    }
+                };
+                let chosen = if twin && let (Some(every), Some(heat)) = (every, heat.as_mut()) {
+                    heat.get_or_insert_with(Default::default).plan(sent_as, every, shadow.id(), span.first, span.pieces)
+                } else {
+                    None
+                };
+                if let Some(chosen) = chosen {
+                    for run in chosen {
+                        let (lo, _) = shadow.card_piece(&span, run.start - span.first);
+                        let (_, hi) = shadow.card_piece(&span, run.end - 1 - span.first);
+                        let title = shadow.span().0 as usize;
+                        add(shadow.card_run(lo, hi), (title + lo, title + hi));
+                    }
+                } else {
+                    add(span, (from, to));
                 }
             }
         }
+        drop(heat);
         for (shadow, from, len) in looked {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(span) = shadow.card_span(*from, from + len)
@@ -4828,6 +4914,17 @@ impl Host {
                         })
                     })
                     .collect();
+                if heat::every().is_some() {
+                    let mut heat = COMPARE_HEAT.lock().unwrap_or_else(|e| e.into_inner());
+                    let heat = heat.get_or_insert_with(Default::default);
+                    for range in plan.ranges.iter().filter(|r| r.compared && !r.picked) {
+                        for piece in 0..range.span.pieces {
+                            if differs.get((range.at + piece) as usize).is_some_and(|&d| torn::flagged(d)) {
+                                heat.found(range.shadow.id(), range.span.first + piece, plan.sent_as);
+                            }
+                        }
+                    }
+                }
                 let fetched = flagged_pieces(&flags);
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
@@ -5759,7 +5856,13 @@ impl Host {
             }
             None => runs,
         };
-        let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
+        let shifted;
+        let parts = if own.is_some() {
+            shifted = parts.iter().map(|n| n + 1).collect::<Vec<_>>();
+            &shifted[..]
+        } else {
+            parts
+        };
         // The plan for two queues: the textures' states before the preludes
         // move them.
         let probe = two_queues::on().then(|| two_queues::probe(runs));
@@ -5797,9 +5900,15 @@ impl Host {
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        thread_local! {
+            static SUBMIT_LISTS: std::cell::Cell<Vec<Option<ID3D12CommandList>>> = const { std::cell::Cell::new(Vec::new()) };
+            static SUBMIT_FIRSTS: std::cell::Cell<Vec<usize>> = const { std::cell::Cell::new(Vec::new()) };
+        }
+        let mut lists = SUBMIT_LISTS.take();
+        lists.reserve(2 * runs.len());
         // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
+        let mut firsts = SUBMIT_FIRSTS.take();
+        firsts.reserve(runs.len());
         let mut batch = Batch::reused();
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -5844,7 +5953,7 @@ impl Host {
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
         if refresh_front() {
-            batch.refresh_front(runs, &parts);
+            batch.refresh_front(runs, parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
@@ -5938,11 +6047,11 @@ impl Host {
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            let cuts = parts.iter().filter_map(|&n| firsts.get(n).copied());
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
+                for to in cuts.chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
@@ -5975,6 +6084,10 @@ impl Host {
                 texture_back_ranges,
                 writes,
             };
+            lists.clear();
+            firsts.clear();
+            SUBMIT_LISTS.set(lists);
+            SUBMIT_FIRSTS.set(firsts);
             batch.give_back();
             working(was_working);
             return Some((submitted, sent));
@@ -6125,6 +6238,10 @@ impl Host {
         if relay() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         }
+        lists.clear();
+        firsts.clear();
+        SUBMIT_LISTS.set(lists);
+        SUBMIT_FIRSTS.set(firsts);
         batch.give_back();
         working(was_working);
         None
@@ -9457,6 +9574,9 @@ impl Meter {
         submit_split_line(frames);
         fresh_open_line(frames);
         crate::heap_marks::line(frames);
+        heat::lean_line(frames);
+        crate::descriptor::view_lookup::report();
+        crate::descriptor::placed_lookup::report(draws, fps);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {

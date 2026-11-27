@@ -660,6 +660,11 @@ impl SentRuns {
     }
 }
 
+fn card_touched_listed() -> bool {
+    static LISTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LISTED.get_or_init(|| std::env::var_os("VICTORY_CARD_TOUCHED").is_none_or(|v| v == "1"))
+}
+
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
 /// they touch. The ranges are taken: the caller copies them to the card's
@@ -674,6 +679,11 @@ impl SentRuns {
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out: Vec<(Arc<Shadow>, Vec<(usize, usize)>)> = Vec::new();
     let mut touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
+    // The tracked list is the existing fast path. Keep a full scan available for A/B testing.
+    if !card_touched_listed() {
+        touched.clear();
+        touched.extend(CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+    }
     touched.sort_unstable_by_key(|weak| weak.as_ptr() as usize);
     touched.dedup_by(|a, b| a.ptr_eq(b));
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -3760,7 +3770,13 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            thread_local! {
+                static WRITTEN: std::cell::Cell<Vec<(usize, u64)>> = const { std::cell::Cell::new(Vec::new()) };
+            }
+            let mut written = WRITTEN.take();
+            let now = crate::watch::writes_into(a, e, true, &mut written);
+            let Some(now) = now else {
+                WRITTEN.set(written);
                 note_stale(1);
                 return true;
             };
@@ -3768,6 +3784,8 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
+            written.clear();
+            WRITTEN.set(written);
             if stale.is_empty() {
                 continue;
             }
@@ -4368,6 +4386,7 @@ impl Shadow {
         }
         // (Under the lock: what takes the list sees it or finds it set.)
         if !card.touched.swap(true, Ordering::AcqRel)
+            && card_touched_listed()
             && let Some(me) = card.me.get()
         {
             TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
